@@ -1,0 +1,18 @@
+# Credenciales y entorno
+.env
+client_secret.json
+token*.json
+venv/
+
+# Artefactos multimedia y trabajos
+jobs/
+clips_finales/*.mp4
+clips_virales/
+temp_*
+*.part
+*.ytdl
+gradio.log
+
+# Caché Python
+__pycache__/
+*.py[cod]

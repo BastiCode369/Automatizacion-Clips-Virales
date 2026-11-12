@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Pipeline Automatizado de Clips Virales para Kick (Linux / Kubuntu)
+Dependencias: pip install google-genai pydantic yt-dlp
+Sistema: sudo apt install ffmpeg
+Uso: python3 pipeline_viral_clips.py "URL_DEL_VOD_DE_KICK"
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import subprocess
+from pathlib import Path
+from typing import List
+from pydantic import BaseModel, Field
+
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError, ServerError
+
+# ==========================================
+# CONFIGURACIÓN GLOBAL Y CONSTANTES
+# ==========================================
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+TEMP_AUDIO = Path("temp_audio.mp3")
+OUTPUT_DIR = Path("clips_virales")
+METADATA_FILE = OUTPUT_DIR / "reporte_clips.json"
+
+# Modelos disponibles y funcionales en tu cuenta
+PRIMARY_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"]
+
+# ==========================================
+# ESQUEMA DE DATOS ESTRICTO PARA GEMINI
+# ==========================================
+class ClipViral(BaseModel):
+    id: int = Field(description="Identificador entero secuencial del clip (1, 2, 3...)")
+    titulo: str = Field(description="Título clickbait o curioso sin spoilers, máximo 6 palabras")
+    inicio: str = Field(description="Timestamp exacto de inicio en formato HH:MM:SS")
+    fin: str = Field(description="Timestamp exacto de finalización en formato HH:MM:SS")
+    gancho: str = Field(description="Transcripción textual exacta de los primeros 3 segundos")
+    razon_viral: str = Field(description="Justificación psicológica y algorítmica de la retención")
+
+class ColeccionClips(BaseModel):
+    clips: List[ClipViral]
+
+# ==========================================
+# PROMPT EDITORIAL DE RETENCIÓN VIRAL
+# ==========================================
+PROMPT_EDITORIAL = """
+Actúa como un Director Editorial y Especialista en Algoritmos de Retención para TikTok, YouTube Shorts e Instagram Reels.
+Analiza el archivo de audio completo de este directo y extrae entre 5 y 8 de los momentos con mayor potencial de viralidad orgánica.
+
+REGLAS ESTRICTAS DE SELECCIÓN Y CORTE:
+1. DURACIÓN DINÁMICA (15 a 45 segundos):
+   - Prohibido incluir introducciones lentas, saludos, silencios o tiempos muertos.
+   - Si el momento cómico, tenso o impactante se resuelve en 20 segundos, el clip debe durar exactamente 20 segundos. No rellenes tiempo.
+   - La diferencia matemática entre `inicio` y `fin` DEBE estar estrictamente entre 15 y 45 segundos.
+
+2. ARQUITECTURA DE RETENCIÓN:
+   - SEGUNDO 0 AL 3 (EL HOOK / GANCHO): El timestamp `inicio` debe comenzar en el milisegundo exacto donde se pronuncia una frase detonante, grito, confesión abrupta, pregunta incómoda o conflicto.
+   - DESARROLLO (CUERPO): Energía alta sostenida y ritmo conversacional rápido.
+   - CORTE EN CLÍMAX (PAYOFF / LOOP): El timestamp `fin` debe cortar abruptamente en el pico de la reacción o remate, justo antes de que baje la energía.
+
+3. PRIORIDAD DE CONTENIDO:
+   - Confesiones personales inesperadas o momentos de alta incomodidad social.
+   - Reacciones desproporcionadas, discusiones acaloradas o remates de comedia involuntaria.
+   - Interacciones espontáneas en la calle o sucesos imprevistos con extraños.
+
+4. FORMATO DE TIEMPO:
+   - Devuelve todos los tiempos estrictamente en formato HH:MM:SS (ejemplo: 01:24:05).
+"""
+
+# ==========================================
+# FUNCIONES DEL PIPELINE
+# ==========================================
+def verificar_entorno() -> str:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("[ERROR] La variable de entorno GEMINI_API_KEY no está definida.")
+        print("Ejecuta primero: export GEMINI_API_KEY='tu_clave_aqui'")
+        sys.exit(1)
+
+    for binario in ["yt-dlp", "ffmpeg"]:
+        res = subprocess.run(["which", binario], capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"[ERROR] No se encontró '{binario}' en el sistema o entorno virtual.")
+            sys.exit(1)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return api_key
+
+def extraer_audio_optimizado(kick_url: str, output_audio: Path) -> None:
+    print("\n[1/4] Extrayendo audio ligero del directo para análisis con IA...")
+    if output_audio.exists():
+        output_audio.unlink()
+
+    # Se usa ba/b[height<=360]/worst para evitar bajar el video a 1080p solo para el audio
+    cmd = [
+        "yt-dlp",
+        "--user-agent", USER_AGENT,
+        "--no-playlist",
+        "-f", "ba/b[height<=360]/worst",
+        "-x",
+        "--audio-format", "mp3",
+        "--postprocessor-args", "ffmpeg:-ac 1 -ar 16000 -b:a 32k",
+        "-o", "temp_audio.%(ext)s",
+        kick_url
+    ]
+
+    try:
+        subprocess.run(cmd, check=True)
+        tamano_mb = output_audio.stat().st_size / (1024 * 1024)
+        print(f"      ✓ Audio listo: {output_audio} ({tamano_mb:.2f} MB)")
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Falló la extracción de audio con yt-dlp (Código {e.returncode}).")
+        sys.exit(1)
+
+def obtener_url_stream_m3u8(kick_url: str) -> str:
+    print("\n[2/4] Obteniendo flujo directo de video (.m3u8) en alta definición...")
+    cmd = [
+        "yt-dlp",
+        "--user-agent", USER_AGENT,
+        "--no-playlist",
+        "-g",
+        "-f", "best",
+        kick_url
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        urls = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        if not urls:
+            raise RuntimeError("yt-dlp no devolvió ninguna URL de stream.")
+        print("      ✓ URL de stream HLS obtenida correctamente.")
+        return urls[0]
+    except Exception as e:
+        print(f"[ERROR] No se pudo obtener la URL directa del stream: {e}")
+        sys.exit(1)
+
+def analizar_audio_con_gemini(api_key: str, audio_path: Path) -> List[dict]:
+    print("\n[3/4] Subiendo audio a Gemini File API y detectando momentos virales...")
+    client = genai.Client(api_key=api_key)
+    audio_file = None
+
+    try:
+        print("      → Subiendo archivo a Google Cloud...")
+        audio_file = client.files.upload(file=str(audio_path))
+        print(f"      → Archivo subido ({audio_file.name}). Verificando estado...")
+
+        while audio_file.state.name == "PROCESSING":
+            print("      ⏳ Procesando audio en los servidores de Google, esperando 5s...")
+            time.sleep(5)
+            audio_file = client.files.get(name=audio_file.name)
+
+        if audio_file.state.name != "ACTIVE":
+            raise RuntimeError(f"El archivo falló con estado: {audio_file.state.name}")
+
+        print("      ✓ Audio activo. Ejecutando análisis editorial...")
+
+        max_intentos = 5
+        espera_base = 10
+        modelos_a_probar = list(dict.fromkeys([PRIMARY_MODEL] + FALLBACK_MODELS))
+        clips_detectados = None
+
+        for modelo_actual in modelos_a_probar:
+            for intento in range(1, max_intentos + 1):
+                try:
+                    print(f"      → Consultando modelo '{modelo_actual}' (Intento {intento}/{max_intentos})...")
+                    response = client.models.generate_content(
+                        model=modelo_actual,
+                        contents=[audio_file, PROMPT_EDITORIAL],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=ColeccionClips,
+                            temperature=0.3,
+                        ),
+                    )
+                    datos = json.loads(response.text)
+                    clips_detectados = datos.get("clips", []) if isinstance(datos, dict) else datos
+                    break
+                except ServerError as e:
+                    print(f"      [!] Pico de demanda en el servidor: {e.message or e}")
+                    if intento < max_intentos:
+                        tiempo_espera = espera_base * intento
+                        print(f"      ⏳ Reintentando en {tiempo_espera}s...")
+                        time.sleep(tiempo_espera)
+                except APIError as e:
+                    if e.code in (404, 400):
+                        print(f"      [!] Modelo '{modelo_actual}' no disponible ({e.message}). Probando alternativa...")
+                        break
+                    elif e.code in (429, 503):
+                        tiempo_espera = espera_base * intento
+                        print(f"      [!] Saturación temporal ({e.code}). Esperando {tiempo_espera}s...")
+                        time.sleep(tiempo_espera)
+                    else:
+                        raise
+
+            if clips_detectados:
+                break
+
+        if not clips_detectados:
+            raise RuntimeError("No se pudo obtener una respuesta válida de Gemini tras los reintentos.")
+
+        print(f"      ✓ Análisis finalizado: {len(clips_detectados)} clips virales detectados.")
+        return clips_detectados
+
+    finally:
+        if audio_file:
+            try:
+                client.files.delete(name=audio_file.name)
+                print(f"      ✓ Archivo remoto ({audio_file.name}) eliminado de la File API.")
+            except Exception as e:
+                print(f"      [!] Aviso: No se pudo borrar el archivo remoto {audio_file.name}: {e}")
+
+def sanitizar_nombre_archivo(texto: str) -> str:
+    limpio = re.sub(r"[^\w\s-]", "", texto.lower())
+    limpio = re.sub(r"[-\s]+", "_", limpio).strip("_")
+    return limpio[:45] or "clip"
+
+def renderizar_clips_verticales(stream_url: str, clips: List[dict]) -> None:
+    print("\n[4/4] Renderizando clips en formato vertical 9:16 (1080x1920) con FFmpeg...")
+
+    filtro_vertical = (
+        "[0:v]split=2[bg][fg];"
+        "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,boxblur=20:5[bg_blur];"
+        "[fg]scale=1080:-2:force_original_aspect_ratio=decrease[fg_sharp];"
+        "[bg_blur][fg_sharp]overlay=(W-w)/2:(H-h)/2,format=yuv420p[outv]"
+    )
+
+    total = len(clips)
+    for idx, clip in enumerate(clips, start=1):
+        clip_id = clip.get("id", idx)
+        titulo = clip.get("titulo", f"clip_{clip_id}")
+        inicio = clip.get("inicio")
+        fin = clip.get("fin")
+        gancho = clip.get("gancho", "")
+
+        slug = sanitizar_nombre_archivo(titulo)
+        archivo_salida = OUTPUT_DIR / f"clip_{clip_id:02d}_{slug}.mp4"
+
+        print(f"\n[{idx}/{total}] Procesando Clip #{clip_id}: '{titulo}' ({inicio} -> {fin})")
+        print(f"      Hook: \"{gancho}\"")
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-stats",
+            "-y",
+            "-user_agent", USER_AGENT,
+            "-ss", inicio,
+            "-to", fin,
+            "-i", stream_url,
+            "-filter_complex", filtro_vertical,
+            "-map", "[outv]",
+            "-map", "0:a?",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "22",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(archivo_salida)
+        ]
+
+        try:
+            subprocess.run(cmd, check=True)
+            print(f"      ✓ Guardado en: {archivo_salida}")
+        except subprocess.CalledProcessError:
+            print(f"      ✗ Error al renderizar el Clip #{clip_id}.")
+
+def main():
+    if len(sys.argv) < 2:
+        print("Uso correcto: python3 pipeline_viral_clips.py \"URL_DEL_DIRECTO_DE_KICK\"")
+        sys.exit(1)
+
+    kick_url = sys.argv[1].strip()
+    api_key = verificar_entorno()
+
+    try:
+        extraer_audio_optimizado(kick_url, TEMP_AUDIO)
+        stream_url = obtener_url_stream_m3u8(kick_url)
+        clips = analizar_audio_con_gemini(api_key, TEMP_AUDIO)
+
+        with open(METADATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(clips, f, ensure_ascii=False, indent=2)
+        print(f"      ✓ Reporte editorial guardado en: {METADATA_FILE}")
+
+        renderizar_clips_verticales(stream_url, clips)
+
+        print("\n" + "=" * 60)
+        print(f"¡PIPELINE COMPLETADO! {len(clips)} clips listos en: ./{OUTPUT_DIR}/")
+        print("=" * 60)
+
+    finally:
+        if TEMP_AUDIO.exists():
+            try:
+                TEMP_AUDIO.unlink()
+                print(f"[LIMPIEZA] Archivo temporal '{TEMP_AUDIO}' eliminado del disco local.")
+            except Exception as e:
+                print(f"[AVISO] No se pudo borrar {TEMP_AUDIO}: {e}")
+
+if __name__ == "__main__":
+    main()

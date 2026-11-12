@@ -1,0 +1,8 @@
+google-genai>=3.0.0
+pydantic>=2.14
+gradio>=6.31
+google-api-python-client>=2.201
+google-auth>=2.62
+google-auth-oauthlib>=1.5
+python-dotenv>=1.2
+yt-dlp>=2026.10.26

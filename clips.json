@@ -1,0 +1,68 @@
+[
+  {
+    "id": 1,
+    "titulo": "¡SE ENTERÓ EN VIVO! La reacción que paralizó el stream 🚨",
+    "inicio": "00:07:07",
+    "fin": "00:07:45",
+    "gancho": "Oye, qué rico",
+    "razon_viral": "Genera intriga inmediata y capta la atención del espectador con un saludo casual que evoluciona rápidamente a una interacción de chat caliente y directa sobre el mundo del streaming colombiano.",
+    "descripcion": "Un momento épico e inesperado en pleno directo.\n¡Suscríbete a Kicksazos para más clips! #Shorts #Kicksazos #StreamColombia #KickColombia",
+    "etiquetas": [
+      "Shorts",
+      "Kicksazos",
+      "StreamColombia",
+      "WestCOL",
+      "KickColombia",
+      "IRLColombia",
+      "ClipsVirales",
+      "Polémica",
+      "StreamersColombia"
+    ],
+    "duracion_segundos": 38,
+    "modelo_ia": "gemini-3.5-flash-lite"
+  },
+  {
+    "id": 2,
+    "titulo": "¡MILLONES EN JUEGO! La verdad oculta del streaming 💸",
+    "inicio": "00:10:07",
+    "fin": "00:10:55",
+    "gancho": "Por qué tanto me ignoras",
+    "razon_viral": "Toca fibras sensibles con una queja de atención que resuena fuertemente con la dinámica de la comunidad y los chats intensos de las plataformas de streaming.",
+    "descripcion": "Reclamos en directo que sacan chispas y revelan la realidad.\n¡Suscríbete a Kicksazos para más clips! #Shorts #Kicksazos #StreamColombia #KickColombia",
+    "etiquetas": [
+      "Shorts",
+      "Kicksazos",
+      "StreamColombia",
+      "WestCOL",
+      "KickColombia",
+      "IRLColombia",
+      "ClipsVirales",
+      "Polémica",
+      "Directos"
+    ],
+    "duracion_segundos": 48,
+    "modelo_ia": "gemini-3.5-flash-lite"
+  },
+  {
+    "id": 3,
+    "titulo": "¡SE PICÓ! Le cantó la tabla sin miedo a nada 🔥",
+    "inicio": "00:13:00",
+    "fin": "00:13:42",
+    "gancho": "Para mí es un placer conocerte",
+    "razon_viral": "El tono de coqueteo y confrontación directa engancha al instante por el morbo de saber cómo reaccionará la otra persona ante semejante propuesta.",
+    "descripcion": "Tensión máxima y propuestas que nadie se espera en directo.\n¡Suscríbete a Kicksazos para más clips! #Shorts #Kicksazos #StreamColombia #KickColombia",
+    "etiquetas": [
+      "Shorts",
+      "Kicksazos",
+      "StreamColombia",
+      "WestCOL",
+      "KickColombia",
+      "IRLColombia",
+      "ClipsVirales",
+      "Polémica",
+      "Rumores"
+    ],
+    "duracion_segundos": 42,
+    "modelo_ia": "gemini-3.5-flash-lite"
+  }
+]
