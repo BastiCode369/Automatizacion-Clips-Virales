@@ -1,6 +1,6 @@
 # CONTEXTO_PROYECTO_KICKSAZOS.md — System Context (Base de Conocimiento Maestra)
 
-> **Generado:** 2026-11-11 21:13 (-05:00) mediante auditoría completa de `~/clips_automation`.
+> **Actualizado (Fase 2):** 2026-11-11 22:13 (-05:00) mediante implementación y pruebas en `~/clips_automation`.
 > **Propósito:** que cualquier agente de IA entienda el código, el flujo de datos, los contratos y el estado real del sistema **sin explorar desde cero**.
 > **Fuente de verdad:** el código fuente. El archivo previo `Contexto y Objetivos del Proyecto Kicksazos.md` contiene afirmaciones **que no coinciden con el código** (ver §6.4).
 > **Seguridad:** todos los secretos aparecen como `<REDACTED>`. Nunca imprimir el contenido de `.env`, `client_secret.json`, `token.json` ni `token_cuenta_anterior.json`.
@@ -24,10 +24,10 @@
 
 **Kicksazos** es un pipeline autónomo en Python que:
 
-1. Recibe una URL (VOD/stream/video de **Kick**, YouTube o Twitch).
-2. Extrae una pista de **audio mono 16 kHz / 32 kbps** con `yt-dlp`.
-3. Sube el audio a la **Gemini File API** y pide a un modelo Gemini (cascada con fallback) que detecte 3–6 momentos virales, devolviendo **timestamps + metadatos SEO** en JSON estructurado (`clips.json`).
-4. Renderiza cada momento en **vertical 9:16 (1080×1920)** con FFmpeg: fondo desenfocado + video centrado sin recorte + marca de agua `assets/watermark.png`.
+1. Recibe una URL (VOD/stream/video de **Kick**, YouTube o Twitch) y crea un contexto aislado en `jobs/<job_id>/`.
+2. Extrae una pista de **audio mono 16 kHz / 32 kbps** directamente desde el stream (`yt-dlp -g` + `ffmpeg -vn` con reconexión), usando `yt-dlp` como fallback automático.
+3. Sube el audio a la **Gemini File API** y pide a un modelo Gemini (cascada con fallback) que detecte 3–6 momentos virales, devolviendo **timestamps + metadatos SEO + subtítulos sincronizados** en JSON estructurado (`clips.json`).
+4. Renderiza cada momento en **vertical 9:16 (1080×1920)** con FFmpeg (acelerado por hardware **VAAPI** `h264_vaapi` en `/dev/dri/renderD128` con fallback automático a CPU `libx264`): fondo desenfocado + video centrado sin recorte + marca de agua adaptativa `assets/watermark.png` + subtítulos dinámicos quemados (`.ass`).
 5. Sube cada clip a **YouTube Shorts en privado** (YouTube Data API v3, OAuth instalado) y registra la trazabilidad en `subidas_shorts.json`.
 
 **Nicho objetivo:** clips IRL / streaming colombiano (Kick Colombia: WestCOL, Blessd, La Liendra, Yhap, eldomi, etc.). Canal destino: **Kicksazos**. Idioma: español coloquial colombiano.
@@ -38,7 +38,7 @@
 |---|---|---|
 | CLI E2E | `venv/bin/python pipeline_viral_clips.py "<URL>" [--solo-analisis] [--sin-subida] [--modelo <id>]` | Pipeline completo headless |
 | GUI Gradio | `venv/bin/python app_interfaz.py` → `http://127.0.0.1:7860` | Mismo pipeline con progreso, galería e historial |
-| Render manual de 1 clip | `venv/bin/python procesar_video_universal.py <URL\|archivo> <HH:MM:SS> <HH:MM:SS> <ID>` | Re-render puntual |
+| Render manual de 1 clip | `venv/bin/python procesar_video_universal.py <URL\|archivo> <HH:MM:SS> <HH:MM:SS> <ID> [JOB_ID]` | Re-render puntual |
 | Upload de prueba | `venv/bin/python subir_shorts.py` | OAuth interactivo + sube el 1er `.mp4` de `clips_finales/` con metadatos de prueba |
 
 ### 1.1 Diagrama de arquitectura (ASCII)
@@ -50,9 +50,10 @@
                 │   GUI: app_interfaz.py ejecutar_pipeline_gradio()            │
                 └───────────────────────────────┬──────────────────────────────┘
                                                 │
-        [1/4] extraer_audio(url)                ▼
-        subprocess: python -m yt_dlp -f "ba/b[height<=360]/b/worst" -x mp3
-        ffmpeg pp: -ac 1 -ar 16000 -b:a 32k  ──►  ./temp_audio.mp3
+        [1/4] extraer_audio(url, job_dir)       ▼
+        1) yt-dlp -g (ba/worst) → ffmpeg (-reconnect* -vn -ac 1 -ar 16000 -b:a 32k)
+        2) Fallback automático: yt-dlp --concurrent-fragments 4 -x mp3
+           ──► jobs/<job_id>/temp_audio.mp3
                                                 │
         obtener_duracion_media() (ffprobe) ──►  duracion_total (float s)
                                                 │
@@ -64,21 +65,27 @@
         │ CASCADA: [preferido] + MODELOS_CANDIDATOS (2 intentos c/u)    │
         │ generate_content_stream(response_schema=list[ClipViral],      │
         │                         mime=application/json, temp=0.35)     │
-        │ _limpiar_y_parsear_json() → validación temporal + SEO         │
+        │ _limpiar_y_parsear_json() → validación temporal, SEO y subs   │
         │ finally: files.delete (remoto)                                │
         └───────────────────────────────┬───────────────────────────────┘
                                         ▼
-                               ./clips.json  (v1: análisis)
+                jobs/<job_id>/clips.json + ./clips.json (v1: análisis + subtitulos)
                                         │
         [3/4] Render                    ▼
-        ¿duracion_total ≤ 3600 s? ── sí ─► descargar_video_fuente() → ./temp_source.mp4 (≤1080p)
+        ¿duracion_total ≤ 3600 s? ── sí ─► descargar_video_fuente() → jobs/<job_id>/temp_source.mp4
                  │ no / fallo                                         │
                  ▼                                                    │
-        obtener_urls_stream() (yt-dlp -g) → URL(s) HLS/MP4 remotas    │
+        obtener_urls_stream(url, job_id) + STREAM_URL_CACHE           │
+        (invalidación y reintento ante HTTP 403/410)                  │
                  └──────────────────────┬─────────────────────────────┘
                                         ▼
-        procesar_clip_ffmpeg() por clip: -ss/-to (input seek) + filter_complex 9:16
-        + overlay watermark  ──►  ./clips_finales/clip_<id>.mp4  (1080x1920 H.264/AAC)
+        procesar_clip_ffmpeg() por clip:
+        ├─ ffprobe dimensiones → watermark adaptativa (y dinámica o y=60 en 9:16)
+        ├─ generar_archivo_ass() → jobs/<job_id>/subs_<id>.ass (si hay subtítulos)
+        ├─ -ss <inicio> -t <duracion> (corte exacto) + filter_complex 9:16 + subtitles=
+        └─ detectar_encoder_hardware(): h264_vaapi (/dev/dri/renderD128, nv12,hwupload, -qp 23)
+           con fallback automático a libx264 (-preset veryfast -crf 22) y fallback sin subs
+           ──►  ./clips_finales/<job_id>_clip_<id>.mp4  (1080x1920 H.264/AAC)
                                         │
         [4/4] Upload (si habilitado)    ▼
         autenticar_youtube(interactivo=False) → token.json (refresh auto)
@@ -87,9 +94,9 @@
                                         │
                 ┌───────────────────────┴───────────────────────┐
                 ▼                                               ▼
-     ./subidas_shorts.json (append/dedupe por youtube_id)   ./clips.json (v2: + archivo_local,
+     ./subidas_shorts.json (append/dedupe por youtube_id)   clips.json (v2: + archivo_local,
                                                              youtube_id, youtube_url, youtube_status)
-        Limpieza (finally): borra temp_audio.mp3 y temp_source.mp4
+        Limpieza (finally): invalida STREAM_URL_CACHE[job_id], borra temp_audio.mp3 y temp_source.mp4
 ```
 
 ---
@@ -221,30 +228,40 @@ legacy/{analizar_stream.py, recortar_clips.py, pipeline_viral_clips.py.bak} : au
 |---|---|---|
 | `GEMINI_TIMEOUT_MS` | `600_000` | `http_options={"timeout": ...}` (milisegundos = 600 s) |
 | `MODELOS_CANDIDATOS` | `["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro-preview", "gemini-3.7-flash", "gemini-2.5-flash", "gemini-2.5-pro"]` | Orden de la cascada y opciones del dropdown Gradio |
-| `RUTA_MARCA_AGUA` | `abspath("assets/watermark.png")` | Resuelta **al importar** (depende del CWD) |
-| `CARPETA_SALIDA` | `abspath("clips_finales")` | Salida de renders |
+| `RUTA_MARCA_AGUA` | `BASE_DIR / "assets/watermark.png"` | Ruta absoluta anclada a `BASE_DIR` |
+| `CARPETA_SALIDA` | `BASE_DIR / "clips_finales"` | Salida de renders |
+| `CARPETA_JOBS` | `BASE_DIR / "jobs"` | Directorios aislados por `job_id` |
+| `VAAPI_DEVICE` | `"/dev/dri/renderD128"` | Dispositivo DRM/VAAPI para aceleración por GPU |
+| `FORMATOS_AUDIO_DIRECTO` | `"ba/worst[height<=360]/worst/b[height<=360]/b"` | Selector `-f` prioritario audio-only o menor resolución para `yt-dlp -g` |
 | `FORMATOS_VIDEO_RAPIDOS` | ver §4.1 | Selector `-f` de yt-dlp para video |
+| `STREAM_URL_CACHE` | `StreamUrlCache()` | Caché en memoria de `video_url`, `audio_url` y dimensiones por `job_id` |
 
 **Funciones:**
 
 | Función | Firma | Responsabilidad | Efectos laterales |
 |---|---|---|---|
-| `ClipViral` | `BaseModel` | Esquema estricto de un clip (id, titulo, inicio, fin, gancho, razon_viral, descripcion, etiquetas) | Se pasa como `response_schema=list[ClipViral]` a Gemini |
+| `StreamUrlCache` | clase | Caché en memoria por `job_id` (`obtener`, `guardar`, `actualizar_dimensiones`, `invalidar`) | Mantiene URLs firmadas durante el job |
+| `SegmentoSubtitulo` | `BaseModel` | Segmento de subtítulo (`inicio_rel`, `fin_rel`, `texto`) | Anidado en `ClipViral.subtitulos` |
+| `ClipViral` | `BaseModel` | Esquema estricto de un clip (`id`, `titulo`, `inicio`, `fin`, `gancho`, `razon_viral`, `descripcion`, `etiquetas`, `subtitulos`) | Se pasa como `response_schema=list[ClipViral]` a Gemini |
 | `obtener_duracion_media` | `(ruta) -> float\|None` | `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1` | Ninguno; devuelve `None` ante cualquier error |
 | `segundos_a_hhmmss` | `(float) -> str` | Redondeo a entero, `HH:MM:SS` | — |
-| `hhmmss_a_segundos` | `(str) -> float` | Acepta `HH:MM:SS`, `MM:SS`, `SS`; **descarta fracciones** (`split(".")[0]`) | `ValueError` si >3 partes |
+| `hhmmss_a_segundos` | `(str) -> float` | Acepta `HH:MM:SS`, `MM:SS`, `SS` con decimales opcionales | `ValueError` si >3 partes |
 | `_obtener_estado_archivo` | `(file) -> str` | Normaliza `file.state` (enum o str) | — |
 | `_normalizar_etiquetas` | `(Any) -> List[str]` | Acepta lista o string separado por `,;\n`; quita `#`; dedup; rellena con defaults hasta 8; corta a 12 | — |
-| `_limpiar_y_parsear_json` | `(texto, duracion_total) -> List[dict]` | Quita fences markdown, valida con pydantic (3 niveles de fallback), validación temporal y enriquecimiento SEO | `ValueError` si no queda ningún clip |
-| `extraer_audio` | `(url) -> "temp_audio.mp3"` | yt-dlp → MP3 mono 16 kHz 32 kbps | **Borra `temp_audio.*`** previos del CWD; crea `temp_audio.mp3` |
-| `construir_prompt_viral` | `(duracion_total) -> str` | Prompt de curaduría (texto íntegro en §4.2) | — |
-| `analizar_con_gemini` | `(ruta_audio, duracion_total, modelo_preferido) -> List[dict]` | Upload File API, polling, cascada de modelos en streaming, parseo | **Escribe `clips.json`**; borra el archivo remoto; `sys.exit(1)` si falta API key |
-| `descargar_video_fuente` | `(url, destino="temp_source.mp4") -> str` | Descarga completa ≤1080p MP4 | Crea `temp_source.mp4` (lo borra si existía) |
-| `obtener_urls_stream` | `(url) -> List[str]` | `yt-dlp -g` (máx 2 URLs: video y audio) | — |
-| `procesar_clip_ffmpeg` | `(url_o_archivo, inicio, fin, id_clip) -> str` | Render 9:16 + watermark. Si el argumento existe como archivo → local; si no → `obtener_urls_stream` (remoto) | Crea/sobrescribe `clips_finales/clip_<id>.mp4`; `FileNotFoundError` si falta watermark |
-| `renderizar_y_subir_clips` | `(url, clips, duracion_total, subir_youtube=True) -> List[str]` | Orquesta fase 3+4 en CLI | Reescribe `clips.json` (v2); append en `subidas_shorts.json`; borra `temp_source.mp4` |
-| `renderizar_clips` | alias | Compatibilidad: `renderizar_y_subir_clips(..., subir_youtube=True)` | — |
-| `main` | argparse | CLI: `url`, `--solo-analisis`, `--sin-subida`, `--modelo` | Borra `temp_audio.mp3` en `finally` |
+| `_normalizar_subtitulos` | `(Any, float) -> List[SegmentoSubtitulo]` | Clamp a `[0, duracion_clip]`, ordena cronológicamente y elimina solapamientos | — |
+| `generar_archivo_ass` | `(subtitulos, ruta_ass) -> str` | Genera archivo `.ass` (1080×1920, `DejaVu Sans` 58 Bold, `Outline=4`, `Alignment=2`, `MarginV=480`) | Crea/sobrescribe `.ass` en disco |
+| `_limpiar_y_parsear_json` | `(texto, duracion_total) -> List[dict]` | Quita fences markdown, valida con pydantic (3 niveles de fallback), validación temporal, SEO y `subtitulos` | `ValueError` si no queda ningún clip |
+| `extraer_audio` | `(url, job_dir=None) -> str` | Streaming directo HLS con `yt-dlp -g` + `ffmpeg -vn` (`-reconnect*`); fallback automático a descarga `yt-dlp` | **Borra `temp_audio.*`** previos del `job_dir`; crea `temp_audio.mp3` |
+| `construir_prompt_viral` | `(duracion_total) -> str` | Prompt de curaduría con instrucciones de `subtitulos` relativos | — |
+| `analizar_con_gemini` | `(ruta_audio, duracion_total, modelo_preferido, job_dir=None) -> List[dict]` | Upload File API, polling, cascada de modelos en streaming, parseo | **Escribe `clips.json`** en `job_dir` y raíz; borra el archivo remoto; `sys.exit(1)` si falta API key |
+| `descargar_video_fuente` | `(url, destino=None) -> str` | Descarga completa ≤1080p MP4 | Crea `temp_source.mp4` en `job_dir` (lo borra si existía) |
+| `obtener_urls_stream` | `(url, job_id=None, forzar_recarga=False) -> List[str]` | `yt-dlp -g` con caché en memoria por `job_id` | Pobla `STREAM_URL_CACHE` |
+| `detectar_encoder_hardware` | `(device_path=VAAPI_DEVICE) -> str` | Verifica `/dev/dri/renderD128` y prueba codificación nula de 1 frame `h264_vaapi` con `lavfi` | Devuelve `"h264_vaapi"` o `"libx264"` sin lanzar excepciones |
+| `obtener_dimensiones_video` | `(fuente) -> Tuple[int,int]\|None` | Consulta `ffprobe` (ancho, alto, SAR, rotación) | — |
+| `procesar_clip_ffmpeg` | `(url_o_archivo, inicio, fin, id_clip, job_id=None, subtitulos=None, job_dir=None) -> str` | Render 9:16 VAAPI/CPU, corte exacto `-t`, watermark adaptativa, `.ass` quemados, refresh 403/410 y fallbacks | Crea `clips_finales/<job_id>_clip_<id>.mp4` y `job_dir/subs_<id>.ass` |
+| `renderizar_y_subir_clips` | `(url, clips, duracion_total, subir_youtube=True, job_id=None, job_dir=None) -> List[str]` | Orquesta fase 3+4 en CLI | Reescribe `clips.json` (v2); append en `subidas_shorts.json`; invalida caché y borra `temp_source.mp4` |
+| `renderizar_clips` | alias | Compatibilidad: `renderizar_y_subir_clips(..., subir_youtube=True, ...)` | — |
+| `main` | argparse | CLI: `url`, `--solo-analisis`, `--sin-subida`, `--modelo` | Crea `JobContext`; borra `temp_audio.mp3` en `finally` |
 
 #### `app_interfaz.py` — GUI Gradio (ACTIVO)
 
@@ -291,50 +308,50 @@ legacy/{analizar_stream.py, recortar_clips.py, pipeline_viral_clips.py.bak} : au
 
 ## 4. Lógica Interna Detallada (Core Logic)
 
-### 4.1 Ingesta y extracción de audio/video (`yt-dlp`)
+### 4.1 Ingesta y extracción de audio/video (`yt-dlp` + streaming directo FFmpeg)
 
-Todas las invocaciones activas usan el intérprete del venv: `[sys.executable, "-m", "yt_dlp", ...]` con `subprocess.run(..., check=True)` (stdout/stderr heredados → aparecen en la consola / `gradio.log`).
+Todas las invocaciones de `yt-dlp` usan el intérprete del venv: `[sys.executable, "-m", "yt_dlp", ...]`.
 
-**Flags comunes:**
+**Flags comunes de `yt-dlp`:**
 - `--js-runtimes node` + `--remote-components ejs:github` → usa Node para resolver los desafíos JS (n-sig/firmas) de YouTube con el componente EJS descargado de GitHub.
 - `--no-playlist` → nunca expande listas.
 - `--force-overwrites` (solo descargas).
 
-**A) Audio para IA — `extraer_audio(url)`**
-```bash
-python -m yt_dlp --js-runtimes node --remote-components ejs:github \
-  --no-playlist --force-overwrites \
-  --concurrent-fragments 4 --retries 5 --fragment-retries 5 \
-  -f "ba/b[height<=360]/b/worst" \
-  -x --audio-format mp3 \
-  --postprocessor-args "ffmpeg:-ac 1 -ar 16000 -b:a 32k" \
-  -o "temp_audio.%(ext)s" "<URL>"
-```
-- Selector: mejor audio-only → si no existe (caso **Kick HLS**, que no ofrece audio separado) mejor muxed ≤360p → mejor → peor.
-- Descarga paralela y resiliencia de red: se incorporan `--concurrent-fragments 4`, `--retries 5` y `--fragment-retries 5` para saturar el ancho de banda descargando fragmentos concurrentemente, evitando los valles de inactividad (caídas a 0 B/s entre peticiones HTTP sucesivas) causados por la latencia en entornos remotos.
-- Resultado: `temp_audio.mp3` (mono, 16 kHz, 32 kbps ≈ 14 MB/h). Antes se borran todos los `temp_audio.*` del CWD.
-- En Kick se descarga primero el contenedor muxed (`temp_audio.mp4`, por fragmentos HLS → aparecen `temp_audio.mp4.part` / `.ytdl`) y luego FFmpegExtractAudio lo convierte. Para VODs de 2 h esto son ~600 MB (observado en `gradio.log`: 613 fragmentos, ~625 MiB).
+**A) Audio para IA — `extraer_audio(url, job_dir=None)`**
+1. **Intento primario (streaming directo sin descargar video muxed):**
+   - Invoca `yt-dlp -f "ba/worst[height<=360]/worst/b[height<=360]/b" -g <URL>` (`_obtener_url_audio_directo`) priorizando audio-only (`ba`) o la variante de menor resolución.
+   - Si obtiene una URL válida, ejecuta `ffmpeg` directamente sobre el stream remoto con flags de reconexión:
+     ```bash
+     ffmpeg -hide_banner -loglevel warning -stats -y \
+       -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 15000000 \
+       -i "<STREAM_URL>" -vn -ac 1 -ar 16000 -b:a 32k "<job_dir>/temp_audio.mp3"
+     ```
+   - Evita descargar archivos muxed pesados (~600 MB en VODs de 2 h de Kick) al descartar el stream de video en vuelo (`-vn`).
+2. **Fallback automático (`yt-dlp`):**
+   - Si `_obtener_url_audio_directo` o el streaming directo con `ffmpeg` fallan (o generan archivo vacío), elimina cualquier resto parcial y ejecuta el método de descarga `yt-dlp --concurrent-fragments 4 --retries 5 --fragment-retries 5 -f "ba/b[height<=360]/b/worst" -x --audio-format mp3 --postprocessor-args "ffmpeg:-ac 1 -ar 16000 -b:a 32k"`.
+- Resultado: `jobs/<job_id>/temp_audio.mp3` (mono, 16 kHz, 32 kbps ≈ 14 MB/h). Previamente se limpian todos los `temp_audio.*` dentro del `job_dir`.
 
-**B) Video fuente completo — `descargar_video_fuente(url)`** (solo si `duracion_total ≤ 3600 s` o desconocida)
+**B) Video fuente completo — `descargar_video_fuente(url, destino)`** (solo si `duracion_total ≤ 3600 s` o desconocida)
 ```bash
 python -m yt_dlp --js-runtimes node --remote-components ejs:github \
   --no-playlist --force-overwrites \
   -f "bestvideo[height<=1080][protocol!=m3u8_native][ext=mp4]+bestaudio[protocol!=m3u8_native][ext=m4a]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[height<=1080]/best" \
   --merge-output-format mp4 \
-  -o "<abs>/temp_source.mp4" "<URL>"
+  -o "<job_dir>/temp_source.mp4" "<URL>"
 ```
 - `FORMATOS_VIDEO_RAPIDOS` prioriza DASH/HTTPS directo (evita HLS `m3u8_native`, más lento) y cae a HLS/muxed si no hay alternativa.
 - Si falla → aviso y se usa seek remoto.
 
-**C) URLs directas para seek remoto — `obtener_urls_stream(url)`** (VOD > 1 h o descarga fallida)
+**C) URLs directas con caché en memoria — `obtener_urls_stream(url, job_id=None, forzar_recarga=False)`**
 ```bash
 python -m yt_dlp --js-runtimes node --remote-components ejs:github \
   --no-playlist -f "<FORMATOS_VIDEO_RAPIDOS>" -g "<URL>"
 ```
 - Devuelve 1 URL (muxed, p. ej. manifest HLS de Kick en CloudFront) o 2 URLs (video + audio separados). Se toman `urls[:2]`.
-- ⚠️ Se llama **una vez por clip** (no se cachea) → N invocaciones de yt-dlp por run remoto.
+- `STREAM_URL_CACHE` (`StreamUrlCache`) almacena `{source_url, video_url, audio_url, dimensiones}` indexado por `job_id` en la primera consulta para evitar repetir `yt-dlp -g` y `ffprobe` en cada clip de VODs largos (>1 h).
+- **Invalidación automática (HTTP 403/410):** si `procesar_clip_ffmpeg` detecta `HTTP error 403/410` o `403 Forbidden / 410 Gone` por expiración de firma temporal, limpia la entrada de `STREAM_URL_CACHE` para ese `job_id`, ejecuta `obtener_urls_stream(..., forzar_recarga=True)` una vez y reintenta el render del clip. La caché del job se limpia en `finally` al finalizar la ejecución.
 
-**Manejo de secciones:** no se usa `--download-sections`; el corte se hace en FFmpeg con *input seek* (`-ss`/`-to` antes de `-i`), tanto local como remoto (FFmpeg solo pide los segmentos HLS/rangos HTTP necesarios).
+**Manejo de secciones:** no se usa `--download-sections`; el corte se hace en FFmpeg con *input seek* (`-ss <inicio>` antes de `-i`) + duración exacta (`-t <duracion_clip>` calculada desde `fin - inicio`), tanto en entrada como en salida.
 
 ### 4.2 Motor de curaduría con IA (Gemini)
 
@@ -346,7 +363,7 @@ python -m yt_dlp --js-runtimes node --remote-components ejs:github \
 5. **Prompt**: `construir_prompt_viral(duracion_total)`.
 6. **Cascada de modelos**: `orden = [modelo_preferido] + MODELOS_CANDIDATOS sin duplicado`.
 7. Por modelo, **2 intentos** con `client.models.generate_content_stream(model, contents=[archivo_subido, prompt], config=GenerateContentConfig(response_mime_type="application/json", response_schema=list[ClipViral], temperature=0.35))`; concatena `chunk.text`.
-8. Parseo con `_limpiar_y_parsear_json`; se añade `modelo_ia` a cada clip; se escribe `clips.json`.
+8. Parseo con `_limpiar_y_parsear_json`; se añade `modelo_ia` a cada clip; se escribe `clips.json` en `job_dir` y raíz.
 9. `finally`: `client.files.delete(name=...)` (errores silenciados).
 
 #### 4.2.2 Matriz de manejo de errores (por intento)
@@ -362,7 +379,7 @@ python -m yt_dlp --js-runtimes node --remote-components ejs:github \
 
 > No hay *exponential backoff con jitter* (a pesar de lo que dice el doc previo): las esperas son fijas (5 s / 2 s). Peor caso ≈ 6 modelos × 2 intentos × (latencia + 5 s).
 
-#### 4.2.3 Prompt de producción (íntegro, `construir_prompt_viral`)
+#### 4.2.3 Prompt de producción (resumen, `construir_prompt_viral`)
 
 ```text
 Actúa como un Senior Growth Hacker, estratega de retención de algoritmo de YouTube Shorts / TikTok y editor experto en el ecosistema de IRL y streaming de Latinoamérica (específicamente Colombia).
@@ -371,34 +388,21 @@ Tu misión es analizar el audio adjunto y detectar los segmentos con mayor poten
 [Si hay duración:] DURACIÓN TOTAL DEL AUDIO: HH:MM:SS (jamás generes timestamps superiores a este límite).
 
 ### 1. MENTALIDAD DE INFERENCIA Y ALGORITMO DE SHORTS:
-- **Hook Explosivo (Primeros 2 segundos):** El clip DEBE abrir de golpe en medio de una frase picante, confesión, grito, cifra escandalosa, pregunta incisiva o momento de alta tensión. Cero introducciones lentas ni saludos.
-- **Ritmo Dinámico:** Evita segmentos con silencios muertos o divagaciones sin rumbo.
-- **Arco Narrativo Completo:** Todo clip debe tener apertura fuerte (hook), desarrollo rápido, clímax narrativo y una resolución o remate contundente (punchline/reacción final).
+- Hook Explosivo (Primeros 2 segundos), Ritmo Dinámico, Arco Narrativo Completo.
 
 ### 2. CONTEXTO CULTURAL Y ECOSISTEMA STREAMING COLOMBIANO:
-Presta máxima atención y prioriza cualquier mención directa, indirecta, tiradera o anécdota sobre:
-- **Personalidades y Streamers:** WestCOL, Blessd (El Bendito), JH de la Cruz, MrStiven (Stiven Tangarife), Daiky Gamboa, La Liendra, Kris R, Ryan Castro, Pelicanger, Barbossa, Cossio, Aida Victoria, streamers de Kick/Twitch Colombia y escena urbana de Medellín, Cali y Bogotá.
-- **Gatillos Virales de Alta Retención:**
-  * Cifras de dinero, apuestas, deudas, compras o gastos extravagantes.
-  * Discusiones en vivo, tiraderas, reclamos, filtraciones o peleas.
-  * Confesiones íntimas, anécdotas callejeras, momentos incómodos en IRL o revelaciones personales.
-  * Humor negro contextual, jerga colombiana auténtica (gonorrea, nea, parce, visaje, etc.) y opiniones controversiales sobre figuras públicas o eventos.
+- Streamers y personalidades (WestCOL, Blessd, JH, MrStiven, etc.) y gatillos virales.
 
 ### 3. DURACIÓN DINÁMICA E INTELIGENTE (SIN CORTES RÍGIDOS):
-- NO apliques una restricción rígida de corte fijo (nunca cortes a los 30s exactos si la historia sigue).
-- La duración debe adaptarse de forma natural e inteligente a la unidad narrativa completa (típicamente entre **25 y 75 segundos**; o proporcional si el video fuente completo es un clip corto).
-- Asegúrate de que el timestamp `inicio` abra exactamente en el gancho y el timestamp `fin` cierre después del remate, sin dejar palabras ni ideas cortadas a la mitad.
+- Entre 25 y 75 segundos (o proporcional en videos cortos), sin cortar ideas a la mitad.
 
-### 4. METADATOS SEO OBLIGATORIOS POR CADA CLIP:
-Por cada clip seleccionado (extrae entre 3 y 6 de los mejores momentos, o los mejores disponibles según la longitud del audio), devuelve en el JSON:
-- `id`, `titulo` (máx 60 caracteres, mayúsculas estratégicas/emojis), `inicio`/`fin` (HH:MM:SS), `gancho` (transcripción textual),
-  `razon_viral`, `descripcion` (2 líneas + CTA de suscripción a Kicksazos + 3–5 hashtags), `etiquetas` (8–12 tags SEO).
-
-Devuelve EXCLUSIVAMENTE un arreglo JSON válido con esta estructura exacta: [ { "id": 1, "titulo": ..., "inicio": "HH:MM:SS", ... } ]
+### 4. METADATOS SEO Y SUBTÍTULOS DINÁMICOS OBLIGATORIOS POR CLIP:
+- `id`, `titulo` (máx 60 chars), `inicio`/`fin` (`HH:MM:SS`), `gancho`, `razon_viral`, `descripcion` (2 líneas + CTA + hashtags), `etiquetas` (8–12 tags SEO).
+- `subtitulos`: lista cronológica de frases cortas (máx 4–6 palabras, sin emojis) con `inicio_rel` y `fin_rel` en segundos relativos `[0.0 .. fin-inicio]`, sin solapamientos.
 ```
-*(La sección 4 está resumida aquí; el texto literal completo está en [pipeline_viral_clips.py L283-L338](file:///home/bastiboy/clips_automation/pipeline_viral_clips.py#L283-L338).)*
+*(El texto literal completo está en `construir_prompt_viral` dentro de [pipeline_viral_clips.py](file:///home/bastiboy/clips_automation/pipeline_viral_clips.py).)*
 
-> Nota: los clips de YouTube Shorts admiten hasta 3 min, pero el prompt sugiere 25–75 s. Las restricciones (máx 60 chars, 8–12 tags, 3–6 clips) **no** se imponen vía JSON Schema; se corrigen en post-proceso.
+> Nota: los clips de YouTube Shorts admiten hasta 3 min, pero el prompt sugiere 25–75 s. Las restricciones (máx 60 chars, 8–12 tags, 3–6 clips, rango de subtítulos) **no** se imponen vía JSON Schema; se normalizan en post-proceso.
 
 #### 4.2.4 Parsing y validación — `_limpiar_y_parsear_json(texto, duracion_total)`
 1. Quita los fences markdown iniciales/finales (triple backtick con o sin `json`) mediante regex.
@@ -412,40 +416,44 @@ Devuelve EXCLUSIVAMENTE un arreglo JSON válido con esta estructura exacta: [ { 
    - `titulo` > 60 chars → recorta a 57 + `"..."`; vacío → `"Clip Viral #n"`.
    - `descripcion` vacía → plantilla `"{gancho|titulo}\n¡Suscríbete a Kicksazos ...! #Shorts #Kicksazos #StreamColombia #KickColombia"`; si no contiene `#shorts` → añade `"\n#Shorts #Kicksazos #StreamColombia"`.
    - `etiquetas` → `_normalizar_etiquetas` (defaults: `Shorts, Kicksazos, StreamColombia, KickColombia, ClipsVirales, IRLColombia, StreamersColombianos, PolémicaStream, WestCOL, YouTubeShorts`).
+   - `subtitulos` → `_normalizar_subtitulos(..., duracion_clip)`: valida tipos, hace clamp a `[0.0, duracion_clip]`, ordena cronológicamente y elimina solapamientos.
    - **Re-numera `id` secuencialmente** (1..N tras descartes) y añade `duracion_segundos`.
 6. Lista vacía → `ValueError`.
 
-### 4.3 Pipeline de renderizado FFmpeg (9:16)
+### 4.3 Pipeline de renderizado FFmpeg (9:16), VAAPI y Subtítulos `.ass`
 
-#### 4.3.1 Comando completo (`procesar_clip_ffmpeg`)
+#### 4.3.1 Detección de hardware y comando completo (`procesar_clip_ffmpeg`)
+- `detectar_encoder_hardware()` comprueba si existe `/dev/dri/renderD128` y ejecuta una prueba nula de 1 frame con `lavfi` (`color=c=black:s=256x256:d=0.1` → `format=nv12,hwupload` → `-c:v h264_vaapi -qp 23 -f null -`). Devuelve `"h264_vaapi"` (activo en GPU AMD Radeon 610M de Kubuntu) o `"libx264"` sin lanzar excepciones.
+- **Modo VAAPI (`h264_vaapi`):** antepone `-vaapi_device /dev/dri/renderD128`, agrega `format=nv12,hwupload` al final del `filter_complex` y codifica con `-c:v h264_vaapi -qp 23`.
+- **Fallback automático a CPU (`libx264`):** si VAAPI no está disponible o falla en tiempo de ejecución, captura el `CalledProcessError` y reintenta automáticamente con `-c:v libx264 -preset veryfast -crf 22 -threads 0`.
 
 Entrada **local** (`temp_source.mp4`):
 ```bash
-ffmpeg -hide_banner -stats -y \
-  -ss <INICIO> -to <FIN> -i <temp_source.mp4> \
+ffmpeg -hide_banner -stats -y [-vaapi_device /dev/dri/renderD128] \
+  -ss <INICIO> -t <DURACION_CLIP> -i <temp_source.mp4> \
   -i <abs>/assets/watermark.png \
   -filter_complex "<FILTRO>" \
-  -map "[outv]" -map "0:a?" \
-  -c:v libx264 -preset veryfast -crf 22 -threads 0 \
+  -map "[outv]" -map "0:a?" -t <DURACION_CLIP> \
+  [-c:v h264_vaapi -qp 23 | -c:v libx264 -preset veryfast -crf 22 -threads 0] \
   -c:a aac -b:a 128k -movflags +faststart \
-  <abs>/clips_finales/clip_<ID>.mp4
+  <abs>/clips_finales/<job_id>_clip_<ID>.mp4
 ```
-Entrada **remota** (por cada URL devuelta por `yt-dlp -g`, se antepone):
+Entrada **remota** (por cada URL en caché o `yt-dlp -g`, se antepone):
 ```bash
--rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -ss <INICIO> -to <FIN> -i <URL_n>
+-rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -ss <INICIO> -t <DURACION_CLIP> -i <URL_n>
 ```
 - Con 2 URLs (video+audio separados): video = input 0, audio = `-map 1:a?`, watermark = input 2.
 - Con 1 URL o archivo local: audio = `-map 0:a?`, watermark = input 1.
-- `-ss`/`-to` **como opciones de entrada** → *fast seek* (salta al keyframe sin decodificar desde 0; `-to` relativo a la posición absoluta del input). Precisión de corte: ±1 GOP en algunos contenedores.
+- **Precisión de corte:** `-ss <INICIO>` como opción de entrada para *fast seek* en red, combinado con `-t <DURACION_CLIP>` calculada exactamente desde `(fin - inicio)` para evitar desfases de cierre por keyframes.
 
-#### 4.3.2 `filter_complex` (desglose)
+#### 4.3.2 `filter_complex`, watermark adaptativa y subtítulos `.ass`
 ```
 [0:v]split=2[bg][fg];
 [bg]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,setsar=1,boxblur=10:2,scale=1080:1920:flags=bilinear[bg_blur];
 [fg]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[fg_scaled];
 [bg_blur][fg_scaled]overlay=(W-w)/2:(H-h)/2[vid_comp];
 [<idx_wm>:v]scale=420:-1,format=rgba,colorchannelmixer=aa=0.92[wm];
-[vid_comp][wm]overlay=(W-w)/2:520,format=yuv420p[outv]
+[vid_comp][wm]overlay=(W-w)/2:<y_wm>[,subtitles='<ruta_ass_escapada>'],<format=nv12,hwupload | format=yuv420p>[outv]
 ```
 
 | Etapa | Qué hace | Por qué |
@@ -454,16 +462,14 @@ Entrada **remota** (por cada URL devuelta por `yt-dlp -g`, se antepone):
 | Fondo `scale 360:640 increase` + `crop 360:640` | Rellena un lienzo 9:16 pequeño recortando laterales | Blur a 360p es ~9× más barato que a 1080p |
 | `boxblur=10:2` | Radio 10, 2 pasadas (≈ gaussiano) | Desenfoque del fondo |
 | `scale=1080:1920:flags=bilinear` | Sube el fondo borroso a 1080×1920 | Upscale barato (el blur oculta artefactos) |
-| Frente `scale=1080:1920 decrease` | Encaja 16:9 sin recorte → 1080×608 para fuente 1920×1080 | Contenido íntegro, centrado |
-| `overlay=(W-w)/2:(H-h)/2` | Centra el frente (y≈656–1264) | Layout clásico "blur bars" |
-| Watermark `scale=420:-1`, `format=rgba`, `colorchannelmixer=aa=0.92` | 420 px de ancho, alfa al 92 % | Marca @Kicksazos semitransparente |
-| `overlay=(W-w)/2:520` | Centrada horizontalmente, **y=520 fijo** | Con `watermark.png` 946×262 → 420×116 → ocupa y≈520–636, justo **encima** del video central (fuentes 16:9) |
-| `format=yuv420p` | Compatibilidad universal (YouTube/móviles) | — |
+| Frente `scale=1080:1920 decrease` | Encaja la fuente sin recorte (respetando aspecto) | Contenido íntegro, centrado |
+| `overlay=(W-w)/2:(H-h)/2` | Centra el frente vertical y horizontalmente | Layout clásico "blur bars" |
+| Watermark adaptativa (`obtener_dimensiones_video`) | `ffprobe` obtiene `(w, h)` efectivos (incl. SAR/rotación). Si la fuente ya es vertical 9:16 (`w/h ≤ 9/16 + 0.03`), fija `y = 60`; si hay barras desenfocadas, usa `y = max(40, (H - h_fg)/2 - h - 24)` | Evita que `watermark.png` invada cuadros 4:3, 1:1 o verticales |
+| Subtítulos dinámicos `.ass` (`generar_archivo_ass`) | Si `clip.subtitulos` tiene segmentos válidos, genera `jobs/<job_id>/subs_<id_clip>.ass` en estilo Shorts (`PlayRes 1080×1920`, `DejaVu Sans` tamaño `58` Bold `-1`, blanco `&H00FFFFFF`, `Outline=4`, sombra suave `Shadow=2`, `Alignment=2`, `MarginV=480`) y aplica `subtitles='<ruta_escapada>'` antes del formato final (y antes de `format=nv12,hwupload` en VAAPI) | Quemado limpio sin emojis sin glifo; si falla el filtro `subtitles`, reintenta automáticamente sin subtítulos sin abortar |
+| Salida `format=nv12,hwupload` / `format=yuv420p` | Superficie NV12 para `h264_vaapi` o YUV420P para `libx264` | Compatibilidad HW/SW y reproducción universal |
 
-- Codificación: `libx264 veryfast CRF 22`, AAC 128 kbps, `+faststart` (moov al inicio). FPS heredado de la fuente (Kick 1080p60 → clips de 60 fps; ~2.0–4.4 Mbps observados).
-- La imagen PNG es una entrada de 1 frame; `overlay` repite el último frame (`eof_action=repeat` por defecto), por lo que no hace falta `-loop 1`.
-- Rendimiento observado en `gradio.log` (HLS remoto Kick 1080p60): **0.8×–1.2× tiempo real**.
-- Si la fuente ya es vertical, el frente ocupa todo el lienzo y el watermark queda encima del contenido.
+- Codificación: `h264_vaapi -qp 23` (GPU) o `libx264 -preset veryfast -crf 22` (CPU), AAC 128 kbps, `+faststart`.
+- La imagen PNG es una entrada de 1 frame; `overlay` repite el último frame (`eof_action=repeat` por defecto).
 
 ### 4.4 Integración con YouTube Data API v3
 
@@ -562,6 +568,13 @@ Ciclo de vida: **v1** escrito por `analizar_con_gemini` (en `job_dir` y sincroni
     "razon_viral": "string",
     "descripcion": "string con \\n y #Shorts",
     "etiquetas": ["8..12 strings sin #"],
+    "subtitulos": [                       // opcional (default []), segmentos relativos al clip
+      {
+        "inicio_rel": 0.0,                // float segundos >= 0.0
+        "fin_rel": 1.8,                   // float segundos <= duracion_clip
+        "texto": "¡NO PUEDE SER ESTO!"     // frase corta (4-6 palabras)
+      }
+    ],
     "duracion_segundos": 51,              // int (fin-inicio)
     "modelo_ia": "gemini-3.8-flash",      // modelo que respondió con éxito
     // --- añadidos en fase render/subida (v2) ---
@@ -710,18 +723,19 @@ Reconstruido a partir del código actual, el `.bak`, los scripts legacy, timesta
 
 ## 7. Estado Actual, Limitaciones Conocidas y Roadmap
 
-### 7.1 Qué funciona (verificado con artefactos)
+### 7.1 Qué funciona (verificado con artefactos y pruebas)
 
 - ✅ Control de versiones activo con Git y `.gitignore` estricto (credenciales, artefactos multimedia, temporales y caché).
 - ✅ Entorno limpio con `requirements.txt` explícito y dependencias residuales desinstaladas (`openai-whisper`, `faster-whisper`, `av`).
 - ✅ Rutas absolutas ancladas a `BASE_DIR = Path(__file__).resolve().parent` en todos los módulos activos (`pipeline_viral_clips.py`, `subir_shorts.py`, `app_interfaz.py`, `procesar_video_universal.py`).
-- ✅ Aislamiento por jobs (`jobs/<job_id>/`) con temporales locales (`temp_audio.mp3`, `temp_source.mp4`, `clips.json`) y prefijo único en renders (`<job_id>_clip_<id>.mp4`).
+- ✅ Aislamiento por jobs (`jobs/<job_id>/`) con temporales locales (`temp_audio.mp3`, `temp_source.mp4`, `subs_<id>.ass`, `clips.json`) y prefijo único en renders (`<job_id>_clip_<id>.mp4`).
 - ✅ Código y artefactos obsoletos archivados en `legacy/`.
-- ✅ Extracción de audio desde Kick VOD (HLS) y YouTube.
-- ✅ Análisis con `gemini-3.8-flash` → 5 clips válidos con SEO.
-- ✅ Render 9:16 1080×1920 H.264/AAC con blur + watermark.
-- ✅ Seek remoto en VOD de >1 h (2 h 06 min) a ~0.8–1.2× tiempo real.
-- ✅ Subida privada a YouTube Shorts (6 en cuenta anterior + 1 prueba en cuenta nueva) con registro en `subidas_shorts.json`.
+- ✅ Extracción directa de audio desde streams HLS con `yt-dlp -g` + `ffmpeg -vn` (con reconexión) y fallback automático a `yt-dlp`.
+- ✅ Caché en memoria (`STREAM_URL_CACHE`) por `job_id` con invalidación y reintento ante errores HTTP 403/410.
+- ✅ Análisis con `gemini-3.8-flash` (cascada de modelos) → clips válidos con SEO + `subtitulos` sincronizados.
+- ✅ Renderizado acelerado por hardware **VAAPI** (`h264_vaapi -qp 23` en `/dev/dri/renderD128` para GPU AMD Radeon 610M) con fallback automático a CPU (`libx264 -preset veryfast -crf 22`).
+- ✅ Watermark adaptativa (`ffprobe` + expresión dinámica según aspecto / 9:16), corte exacto `-t <duracion>` y quemado de subtítulos `.ass` (`DejaVu Sans` Bold 58, `Outline=4`, `Alignment=2`, `MarginV=480`) con fallback seguro sin subtítulos.
+- ✅ Subida privada a YouTube Shorts con registro en `subidas_shorts.json`.
 - ✅ GUI Gradio operativa con soporte para jobs, resolución dinámica de `archivo_local` y galería sincronizada.
 
 ### 7.2 Limitaciones y puntos frágiles
@@ -733,16 +747,16 @@ Reconstruido a partir del código actual, el `.bak`, los scripts legacy, timesta
 4. `GEMINI_API_KEY` ingresada en la GUI muta `os.environ` de forma persistente para el proceso.
 
 **Robustez**
-5. Si **un** render FFmpeg falla (`CalledProcessError`), se aborta el bucle completo y `clips.json` v2 **no** se escribe (las subidas ya hechas sí quedan en `subidas_shorts.json`).
+5. Si **un** render FFmpeg falla definitivamente (`CalledProcessError` tras agotar fallbacks VAAPI/subs/403), se aborta el bucle completo y `clips.json` v2 **no** se escribe (las subidas ya hechas sí quedan en `subidas_shorts.json`).
 6. Sin límite de cuota YouTube en el pipeline activo (~6 uploads/día por proyecto). Sin reintentos en `next_chunk()`.
-7. `obtener_urls_stream` se invoca por clip (URLs firmadas pueden expirar entre clips, pero también es overhead redundante).
-8. Para VODs largos de Kick, la extracción de audio descarga el stream muxed ≤360p completo. Con `--concurrent-fragments 4` el flujo es más rápido y ahora queda encapsulado en su `job_dir`.
-9. `hhmmss_a_segundos` ignora fracciones; *input seek* puede desfasar ±1 GOP.
-10. Watermark en `y=520` fijo: correcto para fuentes 16:9; tapa contenido en fuentes verticales/4:3.
+7. [RESUELTO - FASE 2] `obtener_urls_stream` y dimensiones de stream ahora se cachean en memoria por `job_id` en `STREAM_URL_CACHE`, con invalidación automática y reintento ante HTTP 403/410.
+8. [RESUELTO - FASE 2] `extraer_audio` extrae audio directamente desde el stream HLS con FFmpeg (`-vn -reconnect*`) evitando descargar el video muxed completo salvo fallback.
+9. [RESUELTO - FASE 2] `hhmmss_a_segundos` conserva fracciones decimales y `procesar_clip_ffmpeg` usa `-ss <inicio>` + `-t <duracion_clip>` para evitar desfases de cierre.
+10. [RESUELTO - FASE 2] Watermark posicionada dinámicamente con `ffprobe` (`y=60` en vertical 9:16 o `max(40, (H-h_fg)/2-h-24)` con barras desenfocadas).
 11. `analizar_con_gemini` usa `sys.exit(1)` (no apto para uso como librería).
 12. `_banner_html` interpola `str(e)` y metadatos sin escape HTML (riesgo menor de XSS local).
 13. Los IDs de modelo de `MODELOS_CANDIDATOS` deben mantenerse al día.
-14. La GUI duplica la lógica de orquestación de `renderizar_y_subir_clips` (candidato a unificación en Fase 2).
+14. La GUI duplica la lógica de orquestación de `renderizar_y_subir_clips` (candidato a unificación en Fase 3).
 15. El refresh token puede caducar (7 días si la app OAuth está en modo Testing).
 
 **Higiene del repo**
@@ -755,13 +769,11 @@ Reconstruido a partir del código actual, el `.bak`, los scripts legacy, timesta
 | Prioridad | Fase / Tarea | Detalle |
 |---|---|---|
 | ✅ Hecho | **Fase 1: Higiene, Seguridad, Rutas y Jobs** | Git, `.gitignore`, `requirements.txt`, `BASE_DIR`, `crear_contexto_job()`, `legacy/` |
-| P1 | **Fase 2: Unificación de orquestación** | GUI y CLI llaman a un único motor/generador con callbacks de progreso |
-| P1 | **Fase 2: Tolerancia a fallos por clip** | `try/except` por render individual; persistencia incremental de `clips.json` |
-| P1 | **Fase 2: Gestor de cuota YouTube** | Contador diario en `subidas_shorts.json`; cola de pendientes; reintentos con backoff |
-| P2 | **Fase 3: Optimización de stream Kick** | Extracción directa de audio HLS con ffmpeg sin bajar video muxed intermedio |
-| P2 | **Fase 3: Watermark adaptativo** | Ajuste dinámico de escala y coordenada `y` según aspecto de la fuente |
-| P3 | **Fase 4: Subtítulos dinámicos** | Transcripción de palabras con Gemini → ASS → render FFmpeg |
-| P3 | **Fase 4: Tests unitarios** | Cobertura para parsing JSON, validaciones de tiempo y contratos de jobs |
+| ✅ Hecho | **Fase 2: Red, VAAPI, Precisión y Subtítulos `.ass`** | Audio HLS directo con FFmpeg, caché de URLs + invalidación 403/410, `h264_vaapi` + fallback `libx264`, watermark adaptativa + `-t` exacto, `SegmentoSubtitulo` + `.ass` |
+| P1 | **Fase 3: Unificación de orquestación** | GUI y CLI llaman a un único motor/generador con callbacks de progreso |
+| P1 | **Fase 3: Tolerancia a fallos por clip** | `try/except` por render individual; persistencia incremental de `clips.json` |
+| P1 | **Fase 3: Gestor de cuota YouTube** | Contador diario en `subidas_shorts.json`; cola de pendientes; reintentos con backoff |
+| P2 | **Fase 3: Suite automatizada de tests (`pytest`)** | Cobertura continua para parsing JSON, validaciones de tiempo, `.ass`, caché y jobs |
 
 ---
 
@@ -787,8 +799,8 @@ mv token.json token_backup.json && python subir_shorts.py
 
 **Reglas para agentes que modifiquen el sistema:**
 - No exponer ni imprimir `.env`, `client_secret.json`, `token*.json`.
-- Ejecutar siempre desde `~/clips_automation` (rutas relativas al CWD).
-- No lanzar un run CLI mientras la GUI está procesando (colisión de temporales).
+- Ejecutar usando el entorno `~/clips_automation/venv/bin/python` (todas las rutas activas usan `BASE_DIR` y temporales aislados en `jobs/<job_id>/`).
+- Si ejecutas CLI y GUI simultáneamente, `BASE_DIR / "clips.json"` reflejará el último job completado; cada job conserva su propio `jobs/<job_id>/clips.json`.
 - Cambios en la orquestación → aplicarlos en `pipeline_viral_clips.renderizar_y_subir_clips` **y** en `app_interfaz.ejecutar_pipeline_gradio`.
-- Cambios en `ClipViral` → revisar `_limpiar_y_parsear_json`, `construir_prompt_viral`, `construir_tarjetas_galeria_html`, `obtener_datos_galeria` y `subir_short`.
+- Cambios en `ClipViral` / `SegmentoSubtitulo` → revisar `_limpiar_y_parsear_json`, `construir_prompt_viral`, `generar_archivo_ass`, `construir_tarjetas_galeria_html`, `obtener_datos_galeria` y `subir_short`.
 - Respetar la cuota de YouTube (~6 subidas/día/proyecto).

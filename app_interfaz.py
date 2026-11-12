@@ -21,6 +21,7 @@ from pipeline_viral_clips import (
     CARPETA_JOBS,
     CARPETA_SALIDA,
     MODELOS_CANDIDATOS,
+    STREAM_URL_CACHE,
     _guardar_y_sincronizar_clips,
     analizar_con_gemini,
     crear_contexto_job,
@@ -572,6 +573,8 @@ def ejecutar_pipeline_gradio(
                 clip.get("fin"),
                 cid,
                 job_id=ctx.job_id,
+                subtitulos=clip.get("subtitulos"),
+                job_dir=ctx.job_dir,
             )
             clip["archivo_local"] = ruta_clip
             log(f"✓ Clip #{cid} renderizado en: {ruta_clip}")
@@ -635,6 +638,7 @@ def ejecutar_pipeline_gradio(
         )
         yield banner_err, log(f"[ERROR] {str(e)}"), vid_prev, clips_prev, gal_items, gal_html, hist_filas, hist_html
     finally:
+        STREAM_URL_CACHE.invalidar(ctx.job_id)
         if audio_temp and os.path.exists(audio_temp):
             try:
                 os.remove(audio_temp)

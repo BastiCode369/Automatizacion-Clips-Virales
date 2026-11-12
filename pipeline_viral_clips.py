@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from google import genai
 from google.genai import types
@@ -43,6 +43,8 @@ MODELOS_CANDIDATOS = [
 RUTA_MARCA_AGUA = BASE_DIR / "assets" / "watermark.png"
 CARPETA_SALIDA = BASE_DIR / "clips_finales"
 CARPETA_JOBS = BASE_DIR / "jobs"
+VAAPI_DEVICE = "/dev/dri/renderD128"
+FORMATOS_AUDIO_DIRECTO = "ba/worst[height<=360]/worst/b[height<=360]/b"
 FORMATOS_VIDEO_RAPIDOS = (
     "bestvideo[height<=1080][protocol!=m3u8_native][ext=mp4]+bestaudio[protocol!=m3u8_native][ext=m4a]/"
     "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
@@ -56,6 +58,53 @@ class JobContext(NamedTuple):
     job_dir: Path
 
 
+class StreamUrlCache:
+    """Caché en memoria por job_id para URLs directas de stream (video_url, audio_url) y dimensiones."""
+
+    def __init__(self) -> None:
+        self._entries: Dict[str, Dict[str, Any]] = {}
+
+    def obtener(self, job_id: str, url: str) -> Optional[Dict[str, Any]]:
+        entrada = self._entries.get(job_id)
+        if not entrada or entrada.get("source_url") != url:
+            return None
+        return entrada
+
+    def guardar(
+        self,
+        job_id: str,
+        url: str,
+        urls: List[str],
+        dimensiones: Optional[Tuple[int, int]] = None,
+    ) -> Dict[str, Any]:
+        video_url = urls[0] if len(urls) >= 1 else None
+        audio_url = urls[1] if len(urls) >= 2 else None
+        registro = {
+            "source_url": url,
+            "video_url": video_url,
+            "audio_url": audio_url,
+            "dimensiones": dimensiones,
+        }
+        self._entries[job_id] = registro
+        return registro
+
+    def actualizar_dimensiones(
+        self, job_id: str, url: str, dimensiones: Optional[Tuple[int, int]]
+    ) -> None:
+        entrada = self.obtener(job_id, url)
+        if entrada is not None:
+            entrada["dimensiones"] = dimensiones
+
+    def invalidar(self, job_id: Optional[str] = None) -> None:
+        if job_id is None:
+            self._entries.clear()
+        else:
+            self._entries.pop(job_id, None)
+
+
+STREAM_URL_CACHE = StreamUrlCache()
+
+
 def crear_contexto_job(url: str) -> JobContext:
     """Genera un job_id único YYYYMMDD_HHMMSS_<slug_url> y crea su directorio en BASE_DIR / 'jobs'."""
     slug_limpio = re.sub(r"^https?://(?:www\.)?", "", url.strip())
@@ -66,6 +115,20 @@ def crear_contexto_job(url: str) -> JobContext:
     job_dir = CARPETA_JOBS / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     return JobContext(job_id=job_id, job_dir=job_dir)
+
+
+class SegmentoSubtitulo(BaseModel):
+    """Segmento individual de subtítulo dinámico sincronizado relativo al inicio del clip."""
+
+    inicio_rel: float = Field(
+        description="Segundo de inicio relativo al comienzo del clip (ej. 0.0)."
+    )
+    fin_rel: float = Field(
+        description="Segundo de fin relativo al comienzo del clip (ej. 2.1)."
+    )
+    texto: str = Field(
+        description="Frase corta y contundente de máximo 4 a 6 palabras."
+    )
 
 
 class ClipViral(BaseModel):
@@ -88,6 +151,10 @@ class ClipViral(BaseModel):
     )
     etiquetas: List[str] = Field(
         description="Lista de 8 a 12 tags SEO clave incluyendo nombres propios de involucrados y ecosistema streaming colombiano"
+    )
+    subtitulos: List[SegmentoSubtitulo] = Field(
+        default_factory=list,
+        description="Frases clave cortas (máximo 4-6 palabras) sincronizadas en segundos relativos desde 0.0 hasta la duración del clip.",
     )
 
 
@@ -123,15 +190,15 @@ def segundos_a_hhmmss(segundos: float) -> str:
 
 
 def hhmmss_a_segundos(timestamp: str) -> float:
-    """Convierte un timestamp HH:MM:SS o MM:SS a segundos."""
-    limpio = str(timestamp).strip().split(".")[0]
-    partes = [int(p) for p in limpio.split(":")]
-    if len(partes) == 3:
-        return partes[0] * 3600 + partes[1] * 60 + partes[2]
-    if len(partes) == 2:
-        return partes[0] * 60 + partes[1]
-    if len(partes) == 1:
-        return float(partes[0])
+    """Convierte un timestamp HH:MM:SS, MM:SS o SS (con decimales opcionales) a segundos."""
+    limpio = str(timestamp).strip()
+    trozos = limpio.split(":")
+    if len(trozos) == 3:
+        return int(trozos[0]) * 3600 + int(trozos[1]) * 60 + float(trozos[2])
+    if len(trozos) == 2:
+        return int(trozos[0]) * 60 + float(trozos[1])
+    if len(trozos) == 1:
+        return float(trozos[0])
     raise ValueError(f"Formato de timestamp inválido: {timestamp}")
 
 
@@ -176,6 +243,151 @@ def _normalizar_etiquetas(raw_tags: Any) -> List[str]:
             resultado.append(defecto)
 
     return resultado[:12]
+
+
+def _normalizar_subtitulos(
+    raw_subs: Any, duracion_clip: float
+) -> List[SegmentoSubtitulo]:
+    """Limpia, valida y ordena segmentos de subtítulos relativos dentro de [0, duracion_clip]."""
+    if not isinstance(raw_subs, list) or duracion_clip <= 0:
+        return []
+
+    candidatos: List[SegmentoSubtitulo] = []
+    for seg in raw_subs:
+        if isinstance(seg, SegmentoSubtitulo):
+            ini_raw, fin_raw, txt_raw = seg.inicio_rel, seg.fin_rel, seg.texto
+        elif isinstance(seg, dict):
+            ini_raw = seg.get("inicio_rel")
+            fin_raw = seg.get("fin_rel")
+            txt_raw = seg.get("texto")
+        else:
+            continue
+
+        try:
+            ini = max(0.0, float(ini_raw))
+            fin = min(float(duracion_clip), float(fin_raw))
+        except (TypeError, ValueError):
+            continue
+
+        texto = re.sub(r"\s+", " ", str(txt_raw or "")).strip()
+        if not texto or ini >= duracion_clip or fin <= ini + 0.05:
+            continue
+
+        candidatos.append(
+            SegmentoSubtitulo(
+                inicio_rel=round(ini, 2),
+                fin_rel=round(fin, 2),
+                texto=texto,
+            )
+        )
+
+    candidatos.sort(key=lambda s: (s.inicio_rel, s.fin_rel))
+
+    sin_solape: List[SegmentoSubtitulo] = []
+    for seg in candidatos:
+        if sin_solape and seg.inicio_rel < sin_solape[-1].fin_rel:
+            prev = sin_solape[-1]
+            nuevo_fin_prev = round(seg.inicio_rel, 2)
+            if nuevo_fin_prev >= prev.inicio_rel + 0.05:
+                sin_solape[-1] = SegmentoSubtitulo(
+                    inicio_rel=prev.inicio_rel,
+                    fin_rel=nuevo_fin_prev,
+                    texto=prev.texto,
+                )
+            else:
+                # Si el segmento anterior queda demasiado corto, ajusta inicio del nuevo
+                nuevo_ini = round(prev.fin_rel, 2)
+                if seg.fin_rel <= nuevo_ini + 0.05:
+                    continue
+                seg = SegmentoSubtitulo(
+                    inicio_rel=nuevo_ini,
+                    fin_rel=seg.fin_rel,
+                    texto=seg.texto,
+                )
+        sin_solape.append(seg)
+
+    return sin_solape
+
+
+def _segundos_a_ass_time(segundos: float) -> str:
+    """Convierte segundos decimales al formato ASS H:MM:SS.cc (centisegundos)."""
+    total_cs = max(0, int(round(float(segundos) * 100)))
+    cs = total_cs % 100
+    total_s = total_cs // 100
+    s = total_s % 60
+    total_m = total_s // 60
+    m = total_m % 60
+    h = total_m // 60
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def _limpiar_texto_ass(texto: str) -> str:
+    """Normaliza texto para eventos Dialogue ASS evitando llaves, saltos crudos y emojis sin glifo."""
+    limpio = re.sub(r"[\U00010000-\U0010FFFF\u2600-\u27BF\uFE0F\u200D]+", "", str(texto or ""))
+    limpio = re.sub(r"\s+", " ", limpio).strip()
+    limpio = re.sub(r"\r\n|\r|\n", r"\\N", limpio)
+    limpio = limpio.replace("{", "(").replace("}", ")")
+    return limpio
+
+
+def generar_archivo_ass(
+    subtitulos: List[Any],
+    ruta_ass: str | Path,
+) -> str:
+    """Genera un archivo .ass estilizado para YouTube Shorts (1080x1920) y devuelve su ruta absoluta."""
+    ruta = Path(ruta_ass).resolve()
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+
+    encabezado = "\n".join(
+        [
+            "[Script Info]",
+            "Title: Kicksazos Shorts Subtitles",
+            "ScriptType: v4.00+",
+            "WrapStyle: 0",
+            "ScaledBorderAndShadow: yes",
+            "YCbCr Matrix: TV.709",
+            "PlayResX: 1080",
+            "PlayResY: 1920",
+            "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+            "Style: Default,DejaVu Sans,58,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,2,60,60,480,1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        ]
+    )
+
+    lineas_eventos: List[str] = []
+    for seg in subtitulos or []:
+        if isinstance(seg, SegmentoSubtitulo):
+            ini_raw, fin_raw, txt_raw = seg.inicio_rel, seg.fin_rel, seg.texto
+        elif isinstance(seg, dict):
+            ini_raw = seg.get("inicio_rel")
+            fin_raw = seg.get("fin_rel")
+            txt_raw = seg.get("texto")
+        else:
+            continue
+
+        try:
+            ini = max(0.0, float(ini_raw))
+            fin = float(fin_raw)
+        except (TypeError, ValueError):
+            continue
+
+        texto_ass = _limpiar_texto_ass(str(txt_raw or ""))
+        if not texto_ass or fin <= ini + 0.02:
+            continue
+
+        t_ini = _segundos_a_ass_time(ini)
+        t_fin = _segundos_a_ass_time(fin)
+        lineas_eventos.append(
+            f"Dialogue: 0,{t_ini},{t_fin},Default,,0,0,0,,{texto_ass}"
+        )
+
+    contenido = encabezado + ("\n" + "\n".join(lineas_eventos) if lineas_eventos else "") + "\n"
+    ruta.write_text(contenido, encoding="utf-8")
+    return str(ruta)
 
 
 def _limpiar_y_parsear_json(
@@ -246,6 +458,7 @@ def _limpiar_y_parsear_json(
             desc_raw = f"{desc_raw}\n#Shorts #Kicksazos #StreamColombia"
 
         etiquetas_norm = _normalizar_etiquetas(item.get("etiquetas"))
+        subtitulos_norm = _normalizar_subtitulos(item.get("subtitulos"), duracion_clip)
 
         clip_validado = ClipViral(
             id=len(clips_validos) + 1,
@@ -256,6 +469,7 @@ def _limpiar_y_parsear_json(
             razon_viral=razon_raw,
             descripcion=desc_raw,
             etiquetas=etiquetas_norm,
+            subtitulos=subtitulos_norm,
         )
         clips_validos.append(
             {
@@ -269,8 +483,31 @@ def _limpiar_y_parsear_json(
     return clips_validos
 
 
+def _obtener_url_audio_directo(url: str) -> str:
+    """Obtiene vía yt-dlp -g la URL directa de audio-only o la variante de menor resolución."""
+    comando = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--js-runtimes",
+        "node",
+        "--remote-components",
+        "ejs:github",
+        "--no-playlist",
+        "-f",
+        FORMATOS_AUDIO_DIRECTO,
+        "-g",
+        url,
+    ]
+    res = subprocess.run(comando, capture_output=True, text=True, check=True)
+    urls = [linea.strip() for linea in res.stdout.splitlines() if linea.strip()]
+    if not urls:
+        raise RuntimeError("yt-dlp -g no devolvió URL directa para extracción de audio.")
+    return urls[0]
+
+
 def extraer_audio(url: str, job_dir: Optional[Path | str] = None) -> str:
-    """Descarga y convierte el audio del video fuente a MP3 ligero usando yt-dlp dentro de su job_dir."""
+    """Extrae audio mono 16kHz/32k directo desde stream HLS/remoto con FFmpeg y usa yt-dlp como fallback."""
     print("\n[1/4] Extrayendo audio para análisis con IA...")
     directorio = Path(job_dir).resolve() if job_dir else BASE_DIR
     directorio.mkdir(parents=True, exist_ok=True)
@@ -283,6 +520,55 @@ def extraer_audio(url: str, job_dir: Optional[Path | str] = None) -> str:
         except OSError:
             pass
 
+    # Intento rápido: extraer audio directo desde la URL del manifiesto con FFmpeg (sin bajar video completo)
+    try:
+        print("Consultando URL directa de audio/menor resolución con yt-dlp -g...")
+        stream_url = _obtener_url_audio_directo(url)
+        comando_ffmpeg = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats", "-y"]
+        if stream_url.startswith(("http://", "https://")):
+            comando_ffmpeg.extend(
+                [
+                    "-reconnect",
+                    "1",
+                    "-reconnect_streamed",
+                    "1",
+                    "-reconnect_delay_max",
+                    "5",
+                    "-rw_timeout",
+                    "15000000",
+                ]
+            )
+        comando_ffmpeg.extend(
+            [
+                "-i",
+                stream_url,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-b:a",
+                "32k",
+                str(audio_salida),
+            ]
+        )
+        print("Extrayendo pista de audio directa por streaming con FFmpeg...")
+        subprocess.run(comando_ffmpeg, check=True)
+        if audio_salida.exists() and audio_salida.stat().st_size > 0:
+            return str(audio_salida.resolve())
+        raise RuntimeError("FFmpeg finalizó sin generar un temp_audio.mp3 válido.")
+    except Exception as e:
+        print(
+            f"[AVISO] Extracción directa con FFmpeg falló ({e}); "
+            "activando fallback automático con descarga yt-dlp..."
+        )
+        if audio_salida.exists():
+            try:
+                audio_salida.unlink()
+            except OSError:
+                pass
+
+    # Fallback automático con descarga tradicional de yt-dlp
     salida_template = str(directorio / "temp_audio.%(ext)s")
     comando = [
         sys.executable,
@@ -348,7 +634,7 @@ Presta máxima atención y prioriza cualquier mención directa, indirecta, tirad
 - La duración debe adaptarse de forma natural e inteligente a la unidad narrativa completa (típicamente entre **25 y 75 segundos**; o proporcional si el video fuente completo es un clip corto).
 - Asegúrate de que el timestamp `inicio` abra exactamente en el gancho y el timestamp `fin` cierre después del remate, sin dejar palabras ni ideas cortadas a la mitad.
 
-### 4. METADATOS SEO OBLIGATORIOS POR CADA CLIP:
+### 4. METADATOS SEO Y SUBTÍTULOS DINÁMICOS OBLIGATORIOS POR CLIP:
 Por cada clip seleccionado (extrae entre 3 y 6 de los mejores momentos, o los mejores disponibles según la longitud del audio), devuelve en el JSON:
 - `id`: Entero secuencial (1, 2, 3...).
 - `titulo`: Título magnético de alto CTR, **máximo 60 caracteres**, en español coloquial/streamer (usa mayúsculas estratégicas o emojis puntuales).
@@ -358,18 +644,23 @@ Por cada clip seleccionado (extrae entre 3 y 6 de los mejores momentos, o los me
 - `razon_viral`: Explicación concisa del gatillo psicológico/viral y por qué retendrá a la audiencia.
 - `descripcion`: Resumen corto de **2 líneas** que enganche al espectador + llamado a la acción (CTA) claro de suscripción al canal Kicksazos + 3 a 5 hashtags estratégicos (ej. `#Shorts #Kicksazos #StreamColombia #KickColombia`).
 - `etiquetas`: Lista de **8 a 12 tags SEO** clave (incluyendo nombres propios de los involucrados, nicho IRL, streaming Colombia, etc.).
+- `subtitulos`: Lista cronológica de frases cortas e impactantes (máximo **4 a 6 palabras** por segmento, texto limpio sin emojis) transcribiendo fielmente lo hablado en el clip, sincronizadas en segundos relativos (`inicio_rel`, `fin_rel` como decimales desde `0.0` hasta la duración exacta `fin - inicio`), sin solaparse entre sí.
 
 Devuelve EXCLUSIVAMENTE un arreglo JSON válido con esta estructura exacta:
 [
   {{
     "id": 1,
-    "titulo": " Título magnético máx 60 chars",
+    "titulo": "Título magnético máx 60 chars",
     "inicio": "HH:MM:SS",
     "fin": "HH:MM:SS",
     "gancho": "Primeras palabras textuales del hook",
     "razon_viral": "Explicación del gatillo de retención",
     "descripcion": "Línea 1 de contexto viral.\\nLínea 2 con CTA: ¡Suscríbete a Kicksazos para más clips! #Shorts #Kicksazos #StreamColombia #KickColombia",
-    "etiquetas": ["Shorts", "Kicksazos", "StreamColombia", "WestCOL", "KickColombia", "IRLColombia", "ClipsVirales", "Polémica"]
+    "etiquetas": ["Shorts", "Kicksazos", "StreamColombia", "WestCOL", "KickColombia", "IRLColombia", "ClipsVirales", "Polémica"],
+    "subtitulos": [
+      {{"inicio_rel": 0.0, "fin_rel": 1.8, "texto": "¡NO PUEDE SER ESTO!"}},
+      {{"inicio_rel": 1.9, "fin_rel": 4.2, "texto": "Mira lo que dijo en vivo"}}
+    ]
   }}
 ]
 """
@@ -539,8 +830,23 @@ def descargar_video_fuente(url: str, destino: Optional[Path | str] = None) -> st
     return str(ruta_destino)
 
 
-def obtener_urls_stream(url: str) -> List[str]:
-    """Obtiene URLs directas del stream con yt-dlp -g para seek remoto sin descarga completa."""
+def obtener_urls_stream(
+    url: str,
+    job_id: Optional[str] = None,
+    forzar_recarga: bool = False,
+) -> List[str]:
+    """Obtiene URLs directas del stream con yt-dlp -g usando caché en memoria por job_id."""
+    clave_cache = job_id or f"anon:{url}"
+    if not forzar_recarga:
+        entrada = STREAM_URL_CACHE.obtener(clave_cache, url)
+        if entrada:
+            urls_cacheadas = [
+                u for u in (entrada.get("video_url"), entrada.get("audio_url")) if u
+            ]
+            if urls_cacheadas:
+                print(f"Usando URLs de stream en caché para job '{clave_cache}'.")
+                return urls_cacheadas
+
     comando = [
         sys.executable,
         "-m",
@@ -559,37 +865,200 @@ def obtener_urls_stream(url: str) -> List[str]:
     urls = [linea.strip() for linea in res.stdout.splitlines() if linea.strip()]
     if not urls:
         raise RuntimeError("yt-dlp no devolvió URLs de stream válidas.")
-    return urls[:2]
+    urls_finales = urls[:2]
+    STREAM_URL_CACHE.guardar(clave_cache, url, urls_finales)
+    return urls_finales
 
 
-def procesar_clip_ffmpeg(
-    url_o_archivo: str,
-    inicio: str,
-    fin: str,
-    id_clip: str | int,
-    job_id: Optional[str] = None,
-) -> str:
-    """Extrae el clip con input seek (-ss/-to antes de -i) y renderiza 9:16 optimizado."""
-    if not RUTA_MARCA_AGUA.exists():
-        raise FileNotFoundError(f"No se encontró la marca de agua en {RUTA_MARCA_AGUA}")
+def detectar_encoder_hardware(device_path: str = VAAPI_DEVICE) -> str:
+    """Verifica /dev/dri/renderD128 y prueba codificación nula de 1 frame con h264_vaapi; retorna 'h264_vaapi' o 'libx264'."""
+    try:
+        if not Path(device_path).exists():
+            return "libx264"
+        comando = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-vaapi_device",
+            device_path,
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=256x256:d=0.1",
+            "-vf",
+            "format=nv12,hwupload",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "h264_vaapi",
+            "-qp",
+            "23",
+            "-f",
+            "null",
+            "-",
+        ]
+        res = subprocess.run(comando, capture_output=True, text=True, timeout=10)
+        if res.returncode == 0:
+            return "h264_vaapi"
+    except Exception:
+        pass
+    return "libx264"
 
-    CARPETA_SALIDA.mkdir(parents=True, exist_ok=True)
-    nombre_clip = f"{job_id}_clip_{id_clip}.mp4" if job_id else f"clip_{id_clip}.mp4"
-    archivo_salida = CARPETA_SALIDA / nombre_clip
 
-    print(f"\n--- Procesando Clip {id_clip} ({inicio} -> {fin}) [Salida: {nombre_clip}] ---")
+def obtener_dimensiones_video(fuente: str) -> Optional[Tuple[int, int]]:
+    """Obtiene (ancho, alto) efectivos del stream de video usando ffprobe."""
+    comando = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,sample_aspect_ratio:stream_side_data=rotation",
+        "-of",
+        "json",
+    ]
+    if fuente.startswith(("http://", "https://")):
+        comando.extend(["-rw_timeout", "10000000"])
+    comando.append(fuente)
 
-    if os.path.exists(url_o_archivo):
-        entradas_media = [str(Path(url_o_archivo).resolve())]
-        es_remoto = False
+    try:
+        res = subprocess.run(comando, capture_output=True, text=True, check=True, timeout=15)
+        data = json.loads(res.stdout or "{}")
+        streams = data.get("streams") or []
+        if not streams:
+            return None
+        stream = streams[0]
+        w = int(stream.get("width") or 0)
+        h = int(stream.get("height") or 0)
+        if w <= 0 or h <= 0:
+            return None
+
+        sar = str(stream.get("sample_aspect_ratio") or "")
+        if ":" in sar:
+            try:
+                num, den = (int(x) for x in sar.split(":", 1))
+                if num > 0 and den > 0 and num != den:
+                    w = int(round(w * num / den))
+            except ValueError:
+                pass
+
+        for sd in stream.get("side_data_list") or []:
+            rot = sd.get("rotation")
+            if rot is not None and abs(int(round(float(rot)))) in (90, 270):
+                w, h = h, w
+                break
+
+        return (w, h)
+    except Exception:
+        return None
+
+
+def _calcular_y_watermark(dimensiones: Optional[Tuple[int, int]]) -> str:
+    """Calcula la expresión Y adaptativa para centrar la marca de agua sin invadir el video."""
+    if dimensiones and dimensiones[0] > 0 and dimensiones[1] > 0:
+        w, h = dimensiones
+        aspecto = w / h
+        if aspecto <= (9.0 / 16.0) + 0.03:
+            return "60"
+        h_fg = min(1920, int(round(1080 * h / w)))
     else:
-        entradas_media = obtener_urls_stream(url_o_archivo)
-        es_remoto = True
+        h_fg = 608
+    return f"max(40\\,(H-{h_fg})/2-h-24)"
 
-    comando_ffmpeg = ["ffmpeg", "-hide_banner", "-stats", "-y"]
+
+def _escapar_ruta_ffmpeg_filtro(ruta: str | Path) -> str:
+    """Escapa una ruta absoluta para usarla en subtitles='<ruta>' dentro de -filter_complex."""
+    raw = str(Path(ruta).resolve())
+    lv1 = raw.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    return lv1.replace("'", "'\\''")
+
+
+def _es_error_http_expiracion(stderr_txt: str) -> bool:
+    """Detecta errores HTTP 403/410 en la salida de FFmpeg por expiración de firma temporal."""
+    if not stderr_txt:
+        return False
+    return bool(
+        re.search(
+            r"(?:HTTP\s+error\s+(?:403|410)|Server\s+returned\s+(?:403|410)|403\s+Forbidden|410\s+Gone)",
+            stderr_txt,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _ejecutar_comando_con_captura(comando: List[str]) -> str:
+    """Ejecuta un comando mostrando su salida en consola y capturando stderr para diagnóstico."""
+    proc = subprocess.Popen(
+        comando,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert proc.stdout is not None
+    chunks: List[bytes] = []
+    fd = proc.stdout.fileno()
+    while True:
+        data = os.read(fd, 4096)
+        if not data:
+            break
+        chunks.append(data)
+        try:
+            sys.stderr.buffer.write(data)
+            sys.stderr.buffer.flush()
+        except Exception:
+            try:
+                sys.stderr.write(data.decode("utf-8", errors="replace"))
+                sys.stderr.flush()
+            except Exception:
+                pass
+    returncode = proc.wait()
+    salida_txt = b"".join(chunks).decode("utf-8", errors="replace")
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, comando, output=salida_txt, stderr=salida_txt)
+    return salida_txt
+
+
+def _preparar_archivo_ass_clip(
+    subtitulos: Optional[List[Any]],
+    id_clip: str | int,
+    duracion_clip: float,
+    job_id: Optional[str] = None,
+    job_dir: Optional[Path | str] = None,
+) -> Optional[str]:
+    """Si hay subtítulos válidos para el clip, genera subs_<id_clip>.ass en job_dir."""
+    subs_norm = _normalizar_subtitulos(subtitulos, duracion_clip)
+    if not subs_norm:
+        return None
+    if job_dir:
+        carpeta = Path(job_dir).resolve()
+    elif job_id:
+        carpeta = CARPETA_JOBS / job_id
+    else:
+        carpeta = CARPETA_JOBS / "standalone"
+    carpeta.mkdir(parents=True, exist_ok=True)
+    return generar_archivo_ass(subs_norm, carpeta / f"subs_{id_clip}.ass")
+
+
+def _construir_comando_render(
+    entradas_media: List[str],
+    es_remoto: bool,
+    inicio: str,
+    duracion_str: str,
+    archivo_salida: Path,
+    y_watermark: str,
+    encoder: str,
+    ruta_ass: Optional[str] = None,
+) -> List[str]:
+    """Construye el comando FFmpeg 9:16 con encoder VAAPI o CPU, watermark adaptativa y subtítulos .ass."""
+    comando = ["ffmpeg", "-hide_banner", "-stats", "-y"]
+    if encoder == "h264_vaapi":
+        comando.extend(["-vaapi_device", VAAPI_DEVICE])
+
     for media in entradas_media:
         if es_remoto:
-            comando_ffmpeg.extend(
+            comando.extend(
                 [
                     "-rw_timeout",
                     "15000000",
@@ -601,22 +1070,32 @@ def procesar_clip_ffmpeg(
                     "5",
                 ]
             )
-        comando_ffmpeg.extend(["-ss", inicio, "-to", fin, "-i", media])
+        comando.extend(["-ss", inicio, "-t", duracion_str, "-i", media])
 
     idx_watermark = len(entradas_media)
     idx_audio = "1:a?" if len(entradas_media) > 1 else "0:a?"
-    comando_ffmpeg.extend(["-i", str(RUTA_MARCA_AGUA)])
+    comando.extend(["-i", str(RUTA_MARCA_AGUA)])
 
-    filtro = (
-        "[0:v]split=2[bg][fg];"
-        "[bg]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,setsar=1,boxblur=10:2,scale=1080:1920:flags=bilinear[bg_blur];"
-        "[fg]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[fg_scaled];"
-        "[bg_blur][fg_scaled]overlay=(W-w)/2:(H-h)/2[vid_comp];"
-        f"[{idx_watermark}:v]scale=420:-1,format=rgba,colorchannelmixer=aa=0.92[wm];"
-        "[vid_comp][wm]overlay=(W-w)/2:520,format=yuv420p[outv]"
-    )
+    partes_filtro = [
+        "[0:v]split=2[bg][fg]",
+        "[bg]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,setsar=1,boxblur=10:2,scale=1080:1920:flags=bilinear[bg_blur]",
+        "[fg]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[fg_scaled]",
+        "[bg_blur][fg_scaled]overlay=(W-w)/2:(H-h)/2[vid_comp]",
+        f"[{idx_watermark}:v]scale=420:-1,format=rgba,colorchannelmixer=aa=0.92[wm]",
+    ]
 
-    comando_ffmpeg.extend(
+    cadena_final = [f"[vid_comp][wm]overlay=(W-w)/2:{y_watermark}"]
+    if ruta_ass:
+        ruta_esc = _escapar_ruta_ffmpeg_filtro(ruta_ass)
+        cadena_final.append(f"subtitles='{ruta_esc}'")
+    if encoder == "h264_vaapi":
+        cadena_final.append("format=nv12,hwupload[outv]")
+    else:
+        cadena_final.append("format=yuv420p[outv]")
+    partes_filtro.append(",".join(cadena_final))
+    filtro = ";".join(partes_filtro)
+
+    comando.extend(
         [
             "-filter_complex",
             filtro,
@@ -624,14 +1103,29 @@ def procesar_clip_ffmpeg(
             "[outv]",
             "-map",
             idx_audio,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "22",
-            "-threads",
-            "0",
+            "-t",
+            duracion_str,
+        ]
+    )
+
+    if encoder == "h264_vaapi":
+        comando.extend(["-c:v", "h264_vaapi", "-qp", "23"])
+    else:
+        comando.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "22",
+                "-threads",
+                "0",
+            ]
+        )
+
+    comando.extend(
+        [
             "-c:a",
             "aac",
             "-b:a",
@@ -641,9 +1135,135 @@ def procesar_clip_ffmpeg(
             str(archivo_salida),
         ]
     )
+    return comando
 
-    print("Renderizando composición vertical 9:16 con FFmpeg...")
-    subprocess.run(comando_ffmpeg, check=True)
+
+def procesar_clip_ffmpeg(
+    url_o_archivo: str,
+    inicio: str,
+    fin: str,
+    id_clip: str | int,
+    job_id: Optional[str] = None,
+    subtitulos: Optional[List[Any]] = None,
+    job_dir: Optional[Path | str] = None,
+) -> str:
+    """Extrae el clip con input seek (-ss) y corte exacto (-t), renderiza 9:16 por VAAPI/CPU, watermark adaptativa y .ass."""
+    if not RUTA_MARCA_AGUA.exists():
+        raise FileNotFoundError(f"No se encontró la marca de agua en {RUTA_MARCA_AGUA}")
+
+    duracion_clip = hhmmss_a_segundos(fin) - hhmmss_a_segundos(inicio)
+    if duracion_clip <= 0:
+        raise ValueError(f"Duración de clip inválida ({inicio} -> {fin}).")
+    duracion_str = f"{duracion_clip:.3f}"
+
+    CARPETA_SALIDA.mkdir(parents=True, exist_ok=True)
+    nombre_clip = f"{job_id}_clip_{id_clip}.mp4" if job_id else f"clip_{id_clip}.mp4"
+    archivo_salida = CARPETA_SALIDA / nombre_clip
+
+    print(
+        f"\n--- Procesando Clip {id_clip} ({inicio} -> {fin}, t={duracion_str}s) "
+        f"[Salida: {nombre_clip}] ---"
+    )
+
+    ruta_ass = _preparar_archivo_ass_clip(
+        subtitulos=subtitulos,
+        id_clip=id_clip,
+        duracion_clip=duracion_clip,
+        job_id=job_id,
+        job_dir=job_dir,
+    )
+    if ruta_ass:
+        print(f"✓ Subtítulos dinámicos generados en: {ruta_ass}")
+
+    clave_cache = job_id or f"anon:{url_o_archivo}"
+    if os.path.exists(url_o_archivo):
+        entradas_media = [str(Path(url_o_archivo).resolve())]
+        es_remoto = False
+        dimensiones = obtener_dimensiones_video(entradas_media[0])
+    else:
+        entradas_media = obtener_urls_stream(url_o_archivo, job_id=job_id)
+        es_remoto = True
+        entrada_cache = STREAM_URL_CACHE.obtener(clave_cache, url_o_archivo)
+        dimensiones = entrada_cache.get("dimensiones") if entrada_cache else None
+        if dimensiones is None:
+            dimensiones = obtener_dimensiones_video(entradas_media[0])
+            STREAM_URL_CACHE.actualizar_dimensiones(clave_cache, url_o_archivo, dimensiones)
+
+    y_watermark = _calcular_y_watermark(dimensiones)
+    encoder_activo = detectar_encoder_hardware()
+    ruta_ass_activa = ruta_ass
+    url_refrescada = False
+
+    while True:
+        comando_ffmpeg = _construir_comando_render(
+            entradas_media=entradas_media,
+            es_remoto=es_remoto,
+            inicio=inicio,
+            duracion_str=duracion_str,
+            archivo_salida=archivo_salida,
+            y_watermark=y_watermark,
+            encoder=encoder_activo,
+            ruta_ass=ruta_ass_activa,
+        )
+        print(
+            f"Renderizando composición 9:16 con FFmpeg [encoder={encoder_activo}, "
+            f"wm_y={y_watermark}, subs={'sí' if ruta_ass_activa else 'no'}]..."
+        )
+        try:
+            _ejecutar_comando_con_captura(comando_ffmpeg)
+            break
+        except subprocess.CalledProcessError as err:
+            if archivo_salida.exists():
+                try:
+                    archivo_salida.unlink()
+                except OSError:
+                    pass
+
+            stderr_txt = err.stderr or err.output or ""
+
+            if es_remoto and not url_refrescada and _es_error_http_expiracion(stderr_txt):
+                print(
+                    "[AVISO] Error HTTP 403/410 detectado en stream; "
+                    "invalidando caché y re-obteniendo URLs..."
+                )
+                STREAM_URL_CACHE.invalidar(clave_cache)
+                entradas_media = obtener_urls_stream(
+                    url_o_archivo, job_id=job_id, forzar_recarga=True
+                )
+                dimensiones = obtener_dimensiones_video(entradas_media[0])
+                STREAM_URL_CACHE.actualizar_dimensiones(clave_cache, url_o_archivo, dimensiones)
+                y_watermark = _calcular_y_watermark(dimensiones)
+                url_refrescada = True
+                continue
+
+            if ruta_ass_activa and re.search(
+                r"Parsed_subtitles|subtitles|libass|\.ass", stderr_txt, re.IGNORECASE
+            ):
+                print(
+                    "[AVISO] El filtro de subtítulos .ass falló; "
+                    "reintentando render del clip sin subtítulos..."
+                )
+                ruta_ass_activa = None
+                continue
+
+            if encoder_activo == "h264_vaapi":
+                print(
+                    "[AVISO] Renderizado VAAPI falló en ejecución; "
+                    "reintentando automáticamente con CPU (libx264)..."
+                )
+                encoder_activo = "libx264"
+                continue
+
+            if ruta_ass_activa:
+                print(
+                    "[AVISO] Renderizado falló con subtítulos activos; "
+                    "reintentando sin subtítulos..."
+                )
+                ruta_ass_activa = None
+                continue
+
+            raise
+
     print(f"✓ Clip {id_clip} guardado con éxito en: {archivo_salida}")
     return str(archivo_salida.resolve())
 
@@ -694,7 +1314,13 @@ def renderizar_y_subir_clips(
             inicio = clip.get("inicio")
             fin = clip.get("fin")
             salida = procesar_clip_ffmpeg(
-                entrada_render, inicio, fin, cid, job_id=job_id
+                entrada_render,
+                inicio,
+                fin,
+                cid,
+                job_id=job_id,
+                subtitulos=clip.get("subtitulos"),
+                job_dir=job_dir,
             )
             salidas.append(salida)
             clip["archivo_local"] = salida
@@ -725,6 +1351,8 @@ def renderizar_y_subir_clips(
         _guardar_y_sincronizar_clips(clips, job_dir=job_dir)
         return salidas
     finally:
+        if job_id:
+            STREAM_URL_CACHE.invalidar(job_id)
         if fuente_local and os.path.exists(fuente_local):
             try:
                 os.remove(fuente_local)
