@@ -8,16 +8,17 @@ from dotenv import load_dotenv
 load_dotenv(BASE_DIR / ".env")
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import glob
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, List, NamedTuple, Optional, Tuple
 
 from google import genai
 from google.genai import types
@@ -29,9 +30,12 @@ from subir_shorts import (
     autenticar_youtube,
     cargar_historial_subidas,
     subir_short,
+    verificar_cuota_diaria,
 )
 
 GEMINI_TIMEOUT_MS = 600_000  # google-genai HttpOptions.timeout usa milisegundos (600_000 ms = 600.0s)
+ZONA_HORARIA_LOCAL = timezone(timedelta(hours=-5))  # Hora local Colombia (-05:00)
+LIMITE_CUOTA_DIARIA_SHORTS = 6
 MODELOS_CANDIDATOS = [
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
@@ -680,18 +684,45 @@ def _guardar_y_sincronizar_clips(clips: List[dict], job_dir: Optional[Path | str
         json.dump(clips, f, indent=2, ensure_ascii=False)
 
 
+def _esperar_con_jitter(
+    intento: int,
+    base: float = 3.0,
+    max_espera: float = 30.0,
+    on_log: Optional[Callable[[str], None]] = None,
+    contexto: str = "",
+) -> float:
+    """Ejecuta backoff exponencial con jitter aleatorio usando random.uniform y retorna los segundos esperados."""
+    techo = min(max_espera, base * (2 ** max(0, intento - 1)))
+    piso = min(techo, max(0.5, techo * 0.5))
+    espera = round(random.uniform(piso, techo), 2)
+    if contexto:
+        msg = f"{contexto} | Espera: {espera:.2f}s"
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+    time.sleep(espera)
+    return espera
+
+
 def analizar_con_gemini(
     ruta_audio: str | Path,
     duracion_total: Optional[float] = None,
     modelo_preferido: Optional[str] = None,
     job_dir: Optional[Path | str] = None,
+    on_log: Optional[Callable[[str], None]] = None,
 ) -> List[dict]:
     """Sube el audio a Gemini File API, espera estado ACTIVE e infiere vía streaming con cascada de modelos."""
-    print("\n[2/4] Subiendo audio a Gemini y ejecutando análisis viral con IA...")
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+
+    _log("\n[2/4] Subiendo audio a Gemini y ejecutando análisis viral con IA...")
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("[ERROR] Falta GEMINI_API_KEY.")
-        sys.exit(1)
+        raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY.")
 
     client = genai.Client(
         api_key=api_key,
@@ -706,12 +737,20 @@ def analizar_con_gemini(
         except Exception as e:
             if intento_up == 4:
                 raise
-            print(f"[AVISO] Reintentando subida a File API ({intento_up}/4) tras error de red: {e}")
-            time.sleep(3 * intento_up)
+            _esperar_con_jitter(
+                intento_up,
+                base=3.0,
+                max_espera=30.0,
+                on_log=on_log,
+                contexto=(
+                    f"[AVISO] Error de red subiendo audio a File API ({type(e).__name__}, "
+                    f"intento {intento_up}/4) antes de reintentar: {e}"
+                ),
+            )
 
     try:
         estado = _obtener_estado_archivo(archivo_subido)
-        print(f"Subido con ID {archivo_subido.name}. Estado inicial: {estado}. Esperando procesamiento...")
+        _log(f"Subido con ID {archivo_subido.name}. Estado inicial: {estado}. Esperando procesamiento...")
         intentos_estado = 0
         while estado != "ACTIVE":
             if estado == "FAILED":
@@ -723,10 +762,10 @@ def analizar_con_gemini(
             try:
                 archivo_subido = client.files.get(name=archivo_subido.name)
                 estado = _obtener_estado_archivo(archivo_subido)
-                print(f"Estado actual del archivo: {estado}")
+                _log(f"Estado actual del archivo: {estado}")
             except Exception as e_get:
-                print(f"[AVISO] Error transitorio consultando estado del archivo: {e_get}")
-        print("✓ Archivo de audio listo y activo para inferencia.")
+                _log(f"[AVISO] Error transitorio consultando estado del archivo: {e_get}")
+        _log("✓ Archivo de audio listo y activo para inferencia.")
 
         prompt = construir_prompt_viral(duracion_total)
 
@@ -737,10 +776,14 @@ def analizar_con_gemini(
 
         clips: Optional[List[dict]] = None
         modelo_usado: Optional[str] = None
+        max_intentos = 2
 
         for modelo in orden_modelos:
-            print(f"Probando análisis en streaming con: {modelo}...")
-            for intento in range(1, 3):
+            _log(f"Probando análisis en streaming con: {modelo}...")
+            for intento in range(1, max_intentos + 1):
+                accion_siguiente = (
+                    "reintentar" if intento < max_intentos else "saltar al siguiente modelo"
+                )
                 try:
                     partes_texto: List[str] = []
                     stream = client.models.generate_content_stream(
@@ -762,24 +805,58 @@ def analizar_con_gemini(
 
                     clips = _limpiar_y_parsear_json(texto_respuesta, duracion_total=duracion_total)
                     modelo_usado = modelo
-                    print(f"✓ Análisis generado con éxito usando {modelo}")
+                    _log(f"✓ Análisis generado con éxito usando {modelo}")
                     break
                 except ServerError as e:
-                    print(f"Servidor ocupado (503) en intento {intento}/2 con {modelo}: {e}")
-                    time.sleep(5)
+                    codigo_err = getattr(e, "code", None) or 503
+                    _esperar_con_jitter(
+                        intento,
+                        base=3.0,
+                        max_espera=30.0,
+                        on_log=on_log,
+                        contexto=(
+                            f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
+                            f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {e}"
+                        ),
+                    )
                 except APIError as e:
-                    if e.code in (400, 404):
-                        print(f"Modelo {modelo} no disponible ({e.code}): {e.message}")
+                    codigo_err = getattr(e, "code", None) or "APIError"
+                    detalle_err = getattr(e, "message", None) or str(e)
+                    if codigo_err in (400, 404):
+                        _log(
+                            f"[AVISO] Modelo {modelo} falló (código {codigo_err}, espera 0.00s "
+                            f"antes de saltar al siguiente modelo): {detalle_err}"
+                        )
                         break
-                    if e.code in (429, 503):
-                        print(f"Límite temporal ({e.code}) en intento {intento}/2 con {modelo}. Esperando 5s...")
-                        time.sleep(5)
+                    if codigo_err in (429, 503):
+                        _esperar_con_jitter(
+                            intento,
+                            base=3.0,
+                            max_espera=30.0,
+                            on_log=on_log,
+                            contexto=(
+                                f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
+                                f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {detalle_err}"
+                            ),
+                        )
                     else:
-                        print(f"Error de API con {modelo}: {e}")
+                        _log(
+                            f"[AVISO] Modelo {modelo} falló (código {codigo_err}, espera 0.00s "
+                            f"antes de saltar al siguiente modelo): {detalle_err}"
+                        )
                         break
                 except Exception as e:
-                    print(f"Aviso en intento {intento}/2 con {modelo}: {e}")
-                    time.sleep(2)
+                    codigo_err = type(e).__name__
+                    _esperar_con_jitter(
+                        intento,
+                        base=2.0,
+                        max_espera=15.0,
+                        on_log=on_log,
+                        contexto=(
+                            f"[AVISO] Modelo {modelo} falló (error {codigo_err}, "
+                            f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {e}"
+                        ),
+                    )
             if clips:
                 break
 
@@ -790,7 +867,7 @@ def analizar_con_gemini(
             c["modelo_ia"] = modelo_usado
 
         _guardar_y_sincronizar_clips(clips, job_dir=job_dir)
-        print(f"✓ Se detectaron {len(clips)} momentos virales con SEO completo y se guardaron en clips.json")
+        _log(f"✓ Se detectaron {len(clips)} momentos virales con SEO completo y se guardaron en clips.json")
         return clips
     finally:
         try:
@@ -1268,30 +1345,82 @@ def procesar_clip_ffmpeg(
     return str(archivo_salida.resolve())
 
 
-def renderizar_y_subir_clips(
+def calcular_publish_at_utc(
+    publish_at_inicio: Optional[str],
+    indice_clip: int = 0,
+    intervalo_horas: int | float = 0,
+) -> Optional[str]:
+    """Convierte fecha/hora local (-05:00) o ISO y suma intervalo_horas * indice_clip a ISO 8601 UTC (Z)."""
+    if not publish_at_inicio or not str(publish_at_inicio).strip():
+        return None
+    texto = str(publish_at_inicio).strip()
+    try:
+        dt = datetime.fromisoformat(texto.replace("Z", "+00:00"))
+    except ValueError as err:
+        raise ValueError(
+            f"Formato de fecha inválido '{texto}'. Usa 'YYYY-MM-DD HH:MM' (hora local Colombia -05:00) o ISO 8601."
+        ) from err
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZONA_HORARIA_LOCAL)
+
+    horas_extra = max(0.0, float(intervalo_horas or 0)) * max(0, int(indice_clip))
+    dt_objetivo = dt + timedelta(hours=horas_extra)
+    return dt_objetivo.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _emitir_estado(
+    fase: str,
+    progreso: float,
+    mensaje: str,
+    clips: Optional[List[dict]] = None,
+    ultimo_video: Optional[str] = None,
+    job_dir: Optional[str] = None,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "fase": fase,
+        "progreso": round(float(progreso), 4),
+        "mensaje": mensaje,
+        "clips": clips if clips is not None else [],
+        "ultimo_video": ultimo_video,
+        "job_dir": job_dir,
+        "error": error,
+    }
+
+
+def _orquestar_render_y_subida(
     url: str,
     clips: List[dict],
     duracion_total: Optional[float] = None,
     subir_youtube: bool = True,
     job_id: Optional[str] = None,
     job_dir: Optional[Path | str] = None,
-) -> List[str]:
-    """Renderiza en 9:16 todos los clips detectados y los sube automáticamente a YouTube Shorts en privado."""
-    print("\n[3/4] Renderizando clips con formato 9:16 y marca de agua @Kicksazos...")
-    fuente_local = None
-    youtube_client = None
+    publish_at_inicio: Optional[str] = None,
+    intervalo_horas: int | float = 0,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> Generator[Dict[str, Any], None, None]:
+    """Orquestador compartido de Fase 3+4 con tolerancia a fallos por clip y control de cuota."""
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
 
-    if subir_youtube:
-        print("\n[4/4] Preparando cliente de YouTube Data API v3 para subida automática en privado...")
-        try:
-            youtube_client = autenticar_youtube(interactivo=False)
-            print("✓ Cliente de YouTube autenticado correctamente.")
-        except Exception as e:
-            print(
-                f"[AVISO] No se pudo inicializar YouTube Data API ({e}). "
-                "Los clips se renderizarán localmente sin interrumpir el flujo."
-            )
-            youtube_client = None
+    job_dir_str = str(Path(job_dir).resolve()) if job_dir else None
+    fuente_local: Optional[str] = None
+    youtube_client = None
+    ultimo_video: Optional[str] = None
+
+    _log("\n[3/4] Renderizando clips con formato 9:16 y marca de agua @Kicksazos...")
+    yield _emitir_estado(
+        fase="fuente",
+        progreso=0.55,
+        mensaje="Fase 3/4: Preparando fuente de video en 1080p...",
+        clips=clips,
+        ultimo_video=ultimo_video,
+        job_dir=job_dir_str,
+    )
 
     try:
         # Para videos <= 1h descargar una sola vez evita múltiples conexiones HTTP/HLS lentas
@@ -1303,53 +1432,127 @@ def renderizar_y_subir_clips(
                     else BASE_DIR / "temp_source.mp4"
                 )
                 fuente_local = descargar_video_fuente(url, destino=destino_fuente)
+                _log(f"✓ Video fuente descargado en {fuente_local}")
             except Exception as e:
-                print(f"[AVISO] Descarga local completa omitida ({e}); usando seek directo en stream...")
+                _log(f"[AVISO] Descarga local completa omitida ({e}); usando seek directo en stream...")
                 fuente_local = None
 
+        if subir_youtube:
+            _log("\n[4/4] Preparando cliente de YouTube Data API v3 para subida automática...")
+            try:
+                youtube_client = autenticar_youtube(interactivo=False)
+                _log("✓ Cliente de YouTube autenticado correctamente.")
+            except Exception as e:
+                _log(
+                    f"[AVISO] No se pudo inicializar YouTube Data API ({e}). "
+                    "Los clips se renderizarán localmente sin interrumpir el flujo."
+                )
+                youtube_client = None
+
         entrada_render = fuente_local or url
-        salidas = []
-        for clip in clips:
-            cid = str(clip.get("id"))
-            inicio = clip.get("inicio")
-            fin = clip.get("fin")
-            salida = procesar_clip_ffmpeg(
-                entrada_render,
-                inicio,
-                fin,
-                cid,
-                job_id=job_id,
-                subtitulos=clip.get("subtitulos"),
-                job_dir=job_dir,
+        total_clips = len(clips)
+        subidos_en_lote = 0
+
+        for idx, clip in enumerate(clips, start=1):
+            cid = clip.get("id", idx)
+            frac = 0.60 + (0.35 * (idx - 1) / max(1, total_clips))
+            _log(
+                f"Procesando Clip #{cid}/{total_clips} ({clip.get('inicio')} -> {clip.get('fin')})..."
             )
-            salidas.append(salida)
-            clip["archivo_local"] = salida
+            yield _emitir_estado(
+                fase="render",
+                progreso=frac,
+                mensaje=f"Renderizando Clip #{cid}/{total_clips}: {clip.get('titulo', '')}",
+                clips=clips,
+                ultimo_video=ultimo_video,
+                job_dir=job_dir_str,
+            )
 
-            if subir_youtube and youtube_client is not None:
-                try:
-                    info_yt = subir_short(
-                        youtube=youtube_client,
-                        ruta_video=salida,
-                        titulo=clip.get("titulo", f"Clip {cid}"),
-                        descripcion=clip.get("descripcion", ""),
-                        etiquetas=clip.get("etiquetas", []),
-                        privacidad="private",
-                        clip_id=clip.get("id"),
-                        guardar_registro=True,
-                    )
-                    clip["youtube_id"] = info_yt["youtube_id"]
-                    clip["youtube_url"] = info_yt["url"]
-                    clip["youtube_status"] = "Subido (Privado)"
-                except Exception as e:
-                    print(f"[AVISO] Error al subir {os.path.basename(salida)} a YouTube: {e}")
-                    clip["youtube_status"] = f"No subido ({str(e)[:80]})"
-            elif not subir_youtube:
-                clip["youtube_status"] = "Subida omitida (--sin-subida)"
-            else:
-                clip["youtube_status"] = "Pendiente de subida (Sin credenciales activas)"
+            try:
+                salida = procesar_clip_ffmpeg(
+                    entrada_render,
+                    clip.get("inicio"),
+                    clip.get("fin"),
+                    str(cid),
+                    job_id=job_id,
+                    subtitulos=clip.get("subtitulos"),
+                    job_dir=job_dir,
+                )
+                clip["archivo_local"] = salida
+                clip["render_status"] = "OK"
+                ultimo_video = salida
+                _log(f"✓ Clip #{cid} renderizado en: {salida}")
 
-        _guardar_y_sincronizar_clips(clips, job_dir=job_dir)
-        return salidas
+                if not subir_youtube:
+                    clip["youtube_status"] = "Subida omitida (--sin-subida)"
+                elif youtube_client is None:
+                    clip["youtube_status"] = "Pendiente de subida (Sin credenciales activas)"
+                else:
+                    cuota = verificar_cuota_diaria(limite_diario=LIMITE_CUOTA_DIARIA_SHORTS)
+                    if not cuota["permitido"]:
+                        clip["youtube_status"] = (
+                            f"Pendiente por cuota diaria ({cuota['limite']}/24h)"
+                        )
+                        _log(
+                            f"[AVISO] Cuota diaria alcanzada ({cuota['subidas_24h']}/{cuota['limite']} "
+                            f"en últimas 24h). Clip #{cid} marcado como '{clip['youtube_status']}'."
+                        )
+                    else:
+                        publish_at_clip = None
+                        if publish_at_inicio and str(publish_at_inicio).strip():
+                            publish_at_clip = calcular_publish_at_utc(
+                                publish_at_inicio,
+                                indice_clip=subidos_en_lote,
+                                intervalo_horas=intervalo_horas,
+                            )
+
+                        msg_yt = f"Subiendo Clip #{cid} a YouTube Shorts"
+                        if publish_at_clip:
+                            msg_yt += f" (Programado UTC: {publish_at_clip})"
+                        else:
+                            msg_yt += " (Privado)"
+                        _log(msg_yt)
+                        yield _emitir_estado(
+                            fase="youtube",
+                            progreso=min(0.98, frac + (0.15 / max(1, total_clips))),
+                            mensaje=msg_yt,
+                            clips=clips,
+                            ultimo_video=ultimo_video,
+                            job_dir=job_dir_str,
+                        )
+
+                        try:
+                            info_yt = subir_short(
+                                youtube=youtube_client,
+                                ruta_video=salida,
+                                titulo=clip.get("titulo", f"Clip {cid}"),
+                                descripcion=clip.get("descripcion", ""),
+                                etiquetas=clip.get("etiquetas", []),
+                                privacidad="private",
+                                clip_id=clip.get("id"),
+                                guardar_registro=True,
+                                publish_at=publish_at_clip,
+                                on_log=_log,
+                            )
+                            clip["youtube_id"] = info_yt["youtube_id"]
+                            clip["youtube_url"] = info_yt["url"]
+                            if info_yt.get("publish_at"):
+                                clip["youtube_publish_at"] = info_yt["publish_at"]
+                                clip["youtube_status"] = f"Programado ({info_yt['publish_at']})"
+                            else:
+                                clip["youtube_status"] = "Subido (Privado)"
+                            subidos_en_lote += 1
+                        except Exception as e_yt:
+                            _log(f"[AVISO] Error al subir Clip #{cid} a YouTube: {e_yt}")
+                            clip["youtube_status"] = f"Error subida ({str(e_yt)[:80]})"
+            except Exception as e_clip:
+                err_txt = str(e_clip)
+                clip["render_status"] = f"Error render ({err_txt[:120]})"
+                clip["youtube_status"] = f"No renderizado ({err_txt[:80]})"
+                _log(f"[ERROR] Falló procesamiento del Clip #{cid}: {err_txt}")
+            finally:
+                # Persistencia incremental tras cada clip sin abortar el lote
+                _guardar_y_sincronizar_clips(clips, job_dir=job_dir)
     finally:
         if job_id:
             STREAM_URL_CACHE.invalidar(job_id)
@@ -1358,6 +1561,187 @@ def renderizar_y_subir_clips(
                 os.remove(fuente_local)
             except OSError:
                 pass
+
+
+def ejecutar_pipeline_completo(
+    url: str,
+    modelo_preferido: Optional[str] = None,
+    solo_analisis: bool = False,
+    subir_youtube: bool = True,
+    publish_at_inicio: Optional[str] = None,
+    intervalo_horas: int | float = 0,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> Generator[Dict[str, Any], None, None]:
+    """Orquestador único (CLI y GUI) que ejecuta el pipeline completo y emite diccionarios de estado."""
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+
+    url_limpia = (url or "").strip()
+    if not url_limpia:
+        msg = "Por favor ingresa una URL válida de Kick, YouTube o Twitch."
+        _log(f"[ERROR] {msg}")
+        yield _emitir_estado("error", 0.0, msg, error=msg)
+        return
+
+    if not os.environ.get("GEMINI_API_KEY"):
+        msg = "Falta GEMINI_API_KEY en el archivo .env o en las variables de entorno."
+        _log(f"[ERROR] {msg}")
+        yield _emitir_estado("error", 0.0, msg, error=msg)
+        return
+
+    if subir_youtube and not solo_analisis and publish_at_inicio and str(publish_at_inicio).strip():
+        try:
+            calcular_publish_at_utc(
+                publish_at_inicio,
+                indice_clip=0,
+                intervalo_horas=intervalo_horas,
+            )
+        except ValueError as e_fecha:
+            msg = str(e_fecha)
+            _log(f"[ERROR] {msg}")
+            yield _emitir_estado("error", 0.0, msg, error=msg)
+            return
+
+    ctx = crear_contexto_job(url_limpia)
+    job_dir_str = str(ctx.job_dir)
+    _log(f"Iniciando Job {ctx.job_id} en {ctx.job_dir}")
+
+    audio_temp: Optional[str] = None
+    clips: List[dict] = []
+    ultimo_video: Optional[str] = None
+
+    try:
+        _log(f"Fase 1/4: Extrayendo pista de audio desde {url_limpia}...")
+        yield _emitir_estado(
+            fase="audio",
+            progreso=0.08,
+            mensaje=f"Fase 1/4: Extrayendo audio ligero en jobs/{ctx.job_id}...",
+            clips=clips,
+            ultimo_video=ultimo_video,
+            job_dir=job_dir_str,
+        )
+        audio_temp = extraer_audio(url_limpia, job_dir=ctx.job_dir)
+        duracion = obtener_duracion_media(audio_temp)
+        dur_str = segundos_a_hhmmss(duracion) if duracion else "Desconocida"
+        _log(f"✓ Audio extraído correctamente ({audio_temp}) | Duración: {dur_str}")
+
+        modelo_label = (modelo_preferido or MODELOS_CANDIDATOS[0]).strip()
+        yield _emitir_estado(
+            fase="gemini",
+            progreso=0.30,
+            mensaje=f"Fase 2/4: Analizando narrativa viral con {modelo_label}...",
+            clips=clips,
+            ultimo_video=ultimo_video,
+            job_dir=job_dir_str,
+        )
+        clips = analizar_con_gemini(
+            audio_temp,
+            duracion_total=duracion,
+            modelo_preferido=modelo_preferido,
+            job_dir=ctx.job_dir,
+            on_log=_log,
+        )
+        for c in clips:
+            _log(
+                f"  • Clip #{c['id']}: {c['titulo']} [{c['inicio']} -> {c['fin']}] | "
+                f"Hook: {str(c.get('gancho', ''))[:45]}..."
+            )
+
+        if solo_analisis:
+            msg_fin = (
+                f"Análisis viral completado ({len(clips)} clips) en jobs/{ctx.job_id}/clips.json y clips.json."
+            )
+            _log(f"✓ {msg_fin}")
+            yield _emitir_estado(
+                fase="completado",
+                progreso=1.0,
+                mensaje=msg_fin,
+                clips=clips,
+                ultimo_video=None,
+                job_dir=job_dir_str,
+            )
+            return
+
+        for estado_lote in _orquestar_render_y_subida(
+            url=url_limpia,
+            clips=clips,
+            duracion_total=duracion,
+            subir_youtube=subir_youtube,
+            job_id=ctx.job_id,
+            job_dir=ctx.job_dir,
+            publish_at_inicio=publish_at_inicio,
+            intervalo_horas=intervalo_horas,
+            on_log=_log,
+        ):
+            if estado_lote.get("ultimo_video"):
+                ultimo_video = estado_lote["ultimo_video"]
+            yield estado_lote
+
+        render_ok = sum(1 for c in clips if c.get("render_status") == "OK")
+        render_err = len(clips) - render_ok
+        subidos_ok = sum(1 for c in clips if c.get("youtube_url"))
+        msg_final = (
+            f"Job {ctx.job_id}: {render_ok}/{len(clips)} clips renderizados en 9:16 "
+            f"({subidos_ok} subidos a YouTube Shorts"
+            + (f", {render_err} con error de render" if render_err else "")
+            + ")."
+        )
+        _log(f"✓ {msg_final}")
+        yield _emitir_estado(
+            fase="completado",
+            progreso=1.0,
+            mensaje=msg_final,
+            clips=clips,
+            ultimo_video=ultimo_video,
+            job_dir=job_dir_str,
+        )
+    except Exception as e:
+        err_msg = str(e)
+        _log(f"[ERROR] {err_msg}")
+        yield _emitir_estado(
+            fase="error",
+            progreso=0.0,
+            mensaje=f"Error en pipeline: {err_msg}",
+            clips=clips,
+            ultimo_video=ultimo_video,
+            job_dir=job_dir_str,
+            error=err_msg,
+        )
+    finally:
+        STREAM_URL_CACHE.invalidar(ctx.job_id)
+        if audio_temp and os.path.exists(audio_temp):
+            try:
+                os.remove(audio_temp)
+            except OSError:
+                pass
+
+
+def renderizar_y_subir_clips(
+    url: str,
+    clips: List[dict],
+    duracion_total: Optional[float] = None,
+    subir_youtube: bool = True,
+    job_id: Optional[str] = None,
+    job_dir: Optional[Path | str] = None,
+    publish_at_inicio: Optional[str] = None,
+    intervalo_horas: int | float = 0,
+) -> List[str]:
+    """Wrapper compatible que delega en _orquestar_render_y_subida y retorna rutas locales exitosas."""
+    for _ in _orquestar_render_y_subida(
+        url=url,
+        clips=clips,
+        duracion_total=duracion_total,
+        subir_youtube=subir_youtube,
+        job_id=job_id,
+        job_dir=job_dir,
+        publish_at_inicio=publish_at_inicio,
+        intervalo_horas=intervalo_horas,
+    ):
+        pass
+    return [c["archivo_local"] for c in clips if c.get("archivo_local")]
 
 
 def renderizar_clips(
@@ -1398,38 +1782,39 @@ def main():
         default=None,
         help="Modelo Gemini preferido para iniciar la cascada de inferencia",
     )
+    parser.add_argument(
+        "--publish-at",
+        default=None,
+        help="Fecha/hora inicio programación (YYYY-MM-DD HH:MM hora Colombia -05:00)",
+    )
+    parser.add_argument(
+        "--intervalo-horas",
+        type=int,
+        default=0,
+        help="Intervalo en horas entre Shorts programados (0-24)",
+    )
     args = parser.parse_args()
 
-    ctx = crear_contexto_job(args.url)
-    print(f"Iniciando Job {ctx.job_id} en {ctx.job_dir}")
+    ultimo_estado: Optional[Dict[str, Any]] = None
+    for estado in ejecutar_pipeline_completo(
+        url=args.url,
+        modelo_preferido=args.modelo,
+        solo_analisis=args.solo_analisis,
+        subir_youtube=not args.sin_subida,
+        publish_at_inicio=args.publish_at,
+        intervalo_horas=args.intervalo_horas,
+        on_log=print,
+    ):
+        ultimo_estado = estado
 
-    audio = extraer_audio(args.url, job_dir=ctx.job_dir)
-    try:
-        duracion = obtener_duracion_media(audio)
-        clips = analizar_con_gemini(
-            audio,
-            duracion_total=duracion,
-            modelo_preferido=args.modelo,
-            job_dir=ctx.job_dir,
-        )
-        if not args.solo_analisis:
-            renderizar_y_subir_clips(
-                args.url,
-                clips,
-                duracion_total=duracion,
-                subir_youtube=not args.sin_subida,
-                job_id=ctx.job_id,
-                job_dir=ctx.job_dir,
-            )
-    finally:
-        if os.path.exists(audio):
-            try:
-                os.remove(audio)
-            except OSError:
-                pass
+    if not ultimo_estado or ultimo_estado.get("error"):
+        err = (ultimo_estado or {}).get("error") or "Error desconocido en el pipeline."
+        print(f"\n[ERROR] Pipeline falló: {err}")
+        sys.exit(1)
 
-    print(f"\n✓ ¡Pipeline completado con éxito para job {ctx.job_id}!")
-    print(f"Revisa {CARPETA_SALIDA}, {ctx.job_dir} y {HISTORIAL_SUBIDAS_FILE}")
+    job_dir_final = ultimo_estado.get("job_dir") or str(CARPETA_JOBS)
+    print(f"\n✓ ¡Pipeline completado con éxito! ({ultimo_estado.get('mensaje')})")
+    print(f"Revisa {CARPETA_SALIDA}, {job_dir_final} y {HISTORIAL_SUBIDAS_FILE}")
 
 
 if __name__ == "__main__":

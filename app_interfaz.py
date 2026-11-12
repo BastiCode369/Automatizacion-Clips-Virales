@@ -7,11 +7,10 @@ BASE_DIR = Path(__file__).resolve().parent
 from dotenv import load_dotenv
 load_dotenv(BASE_DIR / ".env")
 
-import glob
+import html
 import json
 import os
 import re
-import sys
 from datetime import datetime
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
@@ -21,22 +20,14 @@ from pipeline_viral_clips import (
     CARPETA_JOBS,
     CARPETA_SALIDA,
     MODELOS_CANDIDATOS,
-    STREAM_URL_CACHE,
-    _guardar_y_sincronizar_clips,
-    analizar_con_gemini,
-    crear_contexto_job,
-    descargar_video_fuente,
-    extraer_audio,
+    ejecutar_pipeline_completo,
     hhmmss_a_segundos,
     obtener_duracion_media,
-    procesar_clip_ffmpeg,
-    segundos_a_hhmmss,
 )
 from subir_shorts import (
     HISTORIAL_SUBIDAS_FILE,
-    autenticar_youtube,
     cargar_historial_subidas,
-    subir_short,
+    verificar_cuota_diaria,
 )
 
 CUSTOM_CSS = """
@@ -204,6 +195,14 @@ button.primary:hover {
 """
 
 
+def _sanitizar_url_href(url: Any) -> str:
+    """Valida que una URL sea http(s) y la escapa para atributos href."""
+    url_str = str(url or "").strip()
+    if url_str.startswith(("https://", "http://")):
+        return html.escape(url_str, quote=True)
+    return "#"
+
+
 def _banner_html(titulo: str, detalle: str, nivel: str = "run") -> str:
     iconos = {
         "ok": "✅",
@@ -211,11 +210,14 @@ def _banner_html(titulo: str, detalle: str, nivel: str = "run") -> str:
         "err": "❌",
         "run": "⚡",
     }
-    icono = iconos.get(nivel, "⚡")
+    nivel_seguro = nivel if nivel in iconos else "run"
+    icono = iconos[nivel_seguro]
+    titulo_seguro = html.escape(str(titulo), quote=True)
+    detalle_seguro = html.escape(str(detalle), quote=True)
     return (
-        f'<div class="status-banner {nivel}">'
-        f"<strong>{icono} {titulo}</strong><br/>"
-        f"<span>{detalle}</span>"
+        f'<div class="status-banner {nivel_seguro}">'
+        f"<strong>{icono} {titulo_seguro}</strong><br/>"
+        f"<span>{detalle_seguro}</span>"
         f"</div>"
     )
 
@@ -244,7 +246,7 @@ def _indexar_subidas_por_archivo() -> Dict[str, Dict[str, Any]]:
 
 
 def construir_tarjetas_galeria_html(clips: List[Dict[str, Any]]) -> str:
-    """Construye el panel visual HTML con los metadatos, gancho, duración y enlace a YouTube de cada clip."""
+    """Construye el panel visual HTML escapado con metadatos, gancho, duración y enlace a YouTube de cada clip."""
     mapa_subidas = _indexar_subidas_por_archivo()
     if not clips:
         archivos = sorted(CARPETA_SALIDA.glob("*.mp4"))
@@ -256,21 +258,23 @@ def construir_tarjetas_galeria_html(clips: List[Dict[str, Any]]) -> str:
             )
         tarjetas = []
         for ruta in archivos:
-            nombre = ruta.name
+            nombre_esc = html.escape(ruta.name, quote=True)
             dur = obtener_duracion_media(ruta)
-            dur_str = f"{int(round(dur))}s" if dur else "N/D"
-            subida = mapa_subidas.get(nombre)
+            dur_str = html.escape(f"{int(round(dur))}s" if dur else "N/D", quote=True)
+            subida = mapa_subidas.get(ruta.name)
             if subida and subida.get("url"):
+                href_seguro = _sanitizar_url_href(subida["url"])
+                yt_id_esc = html.escape(str(subida.get("youtube_id", "")), quote=True)
                 yt_badge = (
-                    f'<a href="{subida["url"]}" target="_blank" '
+                    f'<a href="{href_seguro}" target="_blank" rel="noopener noreferrer" '
                     f'style="color:#53fc18;font-weight:700;text-decoration:underline;">'
-                    f'🔒 Subido en Privado ({subida.get("youtube_id")})</a>'
+                    f"🔒 Subido en Privado ({yt_id_esc})</a>"
                 )
             else:
                 yt_badge = '<span style="color:#9ca3af;">Local (Sin registro de subida)</span>'
             tarjetas.append(
                 f'<div class="clip-card">'
-                f"<h4>🎬 {nombre}</h4>"
+                f"<h4>🎬 {nombre_esc}</h4>"
                 f'<div class="clip-meta-grid">'
                 f'<div class="clip-meta-item"><strong>Duración:</strong> {dur_str}</div>'
                 f'<div class="clip-meta-item"><strong>Estado YouTube:</strong> {yt_badge}</div>'
@@ -281,7 +285,8 @@ def construir_tarjetas_galeria_html(clips: List[Dict[str, Any]]) -> str:
     tarjetas = []
     for clip in clips:
         cid = clip.get("id", "?")
-        titulo = clip.get("titulo", f"Clip #{cid}")
+        cid_esc = html.escape(str(cid), quote=True)
+        titulo_esc = html.escape(str(clip.get("titulo", f"Clip #{cid}")), quote=True)
         inicio = clip.get("inicio", "00:00:00")
         fin = clip.get("fin", "00:00:00")
         try:
@@ -289,9 +294,13 @@ def construir_tarjetas_galeria_html(clips: List[Dict[str, Any]]) -> str:
         except Exception:
             dur_s = clip.get("duracion_segundos", 0)
 
-        gancho = clip.get("gancho", "—")
-        razon = clip.get("razon_viral", "—")
-        descripcion = clip.get("descripcion", "—")
+        inicio_esc = html.escape(str(inicio), quote=True)
+        fin_esc = html.escape(str(fin), quote=True)
+        dur_esc = html.escape(str(dur_s), quote=True)
+
+        gancho_esc = html.escape(str(clip.get("gancho", "—")), quote=True)
+        razon_esc = html.escape(str(clip.get("razon_viral", "—")), quote=True)
+        descripcion_esc = html.escape(str(clip.get("descripcion", "—")), quote=True)
         etiquetas = clip.get("etiquetas") or []
 
         ruta_local = clip.get("archivo_local")
@@ -300,6 +309,7 @@ def construir_tarjetas_galeria_html(clips: List[Dict[str, Any]]) -> str:
         else:
             candidatos = list(CARPETA_SALIDA.glob(f"*clip_{cid}.mp4"))
             nombre_archivo = candidatos[0].name if candidatos else f"clip_{cid}.mp4"
+        nombre_archivo_esc = html.escape(str(nombre_archivo), quote=True)
 
         subida = mapa_subidas.get(nombre_archivo)
 
@@ -307,30 +317,36 @@ def construir_tarjetas_galeria_html(clips: List[Dict[str, Any]]) -> str:
         yt_status = clip.get("youtube_status") or (
             "Subido (Privado)" if yt_url else "Renderizado Localmente"
         )
+        yt_status_esc = html.escape(str(yt_status), quote=True)
 
         if yt_url:
+            href_seguro = _sanitizar_url_href(yt_url)
             yt_html = (
-                f'<span class="k-badge k-badge-kick">🔒 {yt_status}</span> '
-                f'<a href="{yt_url}" target="_blank" '
+                f'<span class="k-badge k-badge-kick">🔒 {yt_status_esc}</span> '
+                f'<a href="{href_seguro}" target="_blank" rel="noopener noreferrer" '
                 f'style="color:#53fc18;font-weight:700;margin-left:8px;text-decoration:underline;">'
                 f"Abrir en YouTube Shorts ↗</a>"
             )
         else:
-            yt_html = f'<span class="k-badge k-badge-purple">{yt_status}</span>'
+            clase_badge = "k-badge-yt" if "error" in str(yt_status).lower() or "no renderizado" in str(yt_status).lower() else "k-badge-purple"
+            yt_html = f'<span class="k-badge {clase_badge}">{yt_status_esc}</span>'
 
-        pills_html = "".join(f'<span class="tag-pill">#{t}</span>' for t in etiquetas)
+        pills_html = "".join(
+            f'<span class="tag-pill">#{html.escape(str(t), quote=True)}</span>'
+            for t in etiquetas
+        )
 
         tarjetas.append(
             f'<div class="clip-card">'
-            f"<h4>🔥 Clip #{cid}: {titulo}</h4>"
+            f"<h4>🔥 Clip #{cid_esc}: {titulo_esc}</h4>"
             f'<div style="margin-bottom:8px;">{yt_html}</div>'
             f'<div class="clip-meta-grid">'
-            f'<div class="clip-meta-item">⏱️ <strong>Timestamps:</strong> {inicio} ➔ {fin} ({dur_s}s)</div>'
-            f'<div class="clip-meta-item">📁 <strong>Archivo:</strong> <code>{nombre_archivo}</code></div>'
+            f'<div class="clip-meta-item">⏱️ <strong>Timestamps:</strong> {inicio_esc} ➔ {fin_esc} ({dur_esc}s)</div>'
+            f'<div class="clip-meta-item">📁 <strong>Archivo:</strong> <code>{nombre_archivo_esc}</code></div>'
             f"</div>"
-            f'<p style="margin:6px 0;">🎯 <strong>Hook (2s):</strong> <em>"{gancho}"</em></p>'
-            f'<p style="margin:6px 0;color:#d1d5db;">🧠 <strong>Gatillo Viral:</strong> {razon}</p>'
-            f'<p style="margin:6px 0;color:#9ca3af;font-size:0.86rem;">📝 <strong>Descripción SEO:</strong> {descripcion}</p>'
+            f'<p style="margin:6px 0;">🎯 <strong>Hook (2s):</strong> <em>"{gancho_esc}"</em></p>'
+            f'<p style="margin:6px 0;color:#d1d5db;">🧠 <strong>Gatillo Viral:</strong> {razon_esc}</p>'
+            f'<p style="margin:6px 0;color:#9ca3af;font-size:0.86rem;">📝 <strong>Descripción SEO:</strong> {descripcion_esc}</p>'
             f'<div style="margin-top:8px;">{pills_html}</div>'
             f"</div>"
         )
@@ -400,36 +416,43 @@ def obtener_datos_galeria() -> Tuple[List[Tuple[str, str]], Optional[str], str, 
 
 
 def obtener_tabla_historial() -> Tuple[List[List[Any]], str]:
-    """Lee subidas_shorts.json y devuelve filas para gr.Dataframe y un resumen HTML."""
+    """Lee subidas_shorts.json y devuelve filas escapadas para gr.Dataframe y un resumen HTML seguro."""
     historial = cargar_historial_subidas(HISTORIAL_SUBIDAS_FILE)
+    cuota = verificar_cuota_diaria()
     if not historial:
-        html = _banner_html(
+        resumen_html = _banner_html(
             "Historial de subidas vacío",
-            f"Aún no se registran videos en {HISTORIAL_SUBIDAS_FILE.name}. Se poblará automáticamente tras el pipeline o subida manual.",
+            f"Aún no se registran videos en {HISTORIAL_SUBIDAS_FILE.name}. "
+            f"Cuota últimas 24h: {cuota['subidas_24h']}/{cuota['limite']}.",
             "warn",
         )
-        return [], html
+        return [], resumen_html
 
     filas: List[List[Any]] = []
     for item in reversed(historial):
+        tags_str = ", ".join(str(t) for t in (item.get("etiquetas") or [])[:6])
         filas.append(
             [
-                item.get("fecha_subida", "—"),
-                item.get("archivo", "—"),
-                item.get("titulo", "—"),
-                item.get("youtube_id", "—"),
-                item.get("url", "—"),
-                item.get("privacidad", "private"),
-                ", ".join((item.get("etiquetas") or [])[:6]),
+                html.escape(str(item.get("fecha_subida") or "—"), quote=True),
+                html.escape(str(item.get("archivo") or "—"), quote=True),
+                html.escape(str(item.get("titulo") or "—"), quote=True),
+                html.escape(str(item.get("youtube_id") or "—"), quote=True),
+                html.escape(str(item.get("url") or "—"), quote=True),
+                html.escape(str(item.get("privacidad") or "private"), quote=True),
+                html.escape(str(item.get("publish_at") or "Inmediato"), quote=True),
+                html.escape(str(item.get("cuenta_id") or "—"), quote=True),
+                html.escape(tags_str or "—", quote=True),
             ]
         )
 
-    html = _banner_html(
-        f"Registro de Subidas Activo ({len(historial)} Shorts en Privado)",
-        "Todos los videos fueron cargados con <code>privacyStatus='private'</code>, <code>categoryId='24'</code> y <code>madeForKids=False</code> listos para programación estratégica.",
-        "ok",
+    nivel_cuota = "ok" if cuota["permitido"] else "warn"
+    resumen_html = _banner_html(
+        f"Registro de Subidas Activo ({len(historial)} Shorts | Cuota 24h: {cuota['subidas_24h']}/{cuota['limite']})",
+        "Todos los videos se cargan con privacyStatus='private', categoryId='24' y madeForKids=False. "
+        f"Cupos disponibles en las últimas 24h: {cuota['restantes']}.",
+        nivel_cuota,
     )
-    return filas, html
+    return filas, resumen_html
 
 
 def ejecutar_pipeline_gradio(
@@ -438,217 +461,83 @@ def ejecutar_pipeline_gradio(
     subir_auto_yt: bool,
     solo_analisis: bool,
     gemini_key: str,
+    publish_at_inicio: str = "",
+    intervalo_horas: int | float = 0,
     progress=gr.Progress(track_tqdm=False),
 ) -> Generator[Tuple[str, str, Optional[str], Any, List[Tuple[str, str]], str, List[List[Any]], str], None, None]:
-    """Ejecuta el pipeline paso a paso actualizando barra de progreso, logs en tiempo real, galería e historial."""
+    """Consume el orquestador único ejecutar_pipeline_completo() y actualiza Gradio en tiempo real."""
     logs: List[str] = []
 
-    def log(msg: str):
+    def registrar_log(msg: str) -> None:
         marca = datetime.now().strftime("%H:%M:%S")
-        linea = f"[{marca}] {msg}"
-        print(linea)
-        logs.append(linea)
-        return "\n".join(logs)
+        for linea_raw in str(msg).splitlines() or [""]:
+            if linea_raw.strip():
+                linea = f"[{marca}] {linea_raw}"
+                print(linea)
+                logs.append(linea)
 
-    url_limpia = (url or "").strip()
-    gal_items, vid_prev, gal_html, clips_prev = obtener_datos_galeria()
-    hist_filas, hist_html = obtener_tabla_historial()
-
-    if not url_limpia:
-        banner = _banner_html(
-            "URL Requerida",
-            "Por favor ingresa una URL válida de YouTube, Kick o Twitch antes de iniciar el pipeline.",
-            "err",
-        )
-        yield banner, log("ERROR: URL vacía."), vid_prev, clips_prev, gal_items, gal_html, hist_filas, hist_html
-        return
+    def _reportar_progreso(valor: float, desc: str) -> None:
+        if progress is not None:
+            try:
+                progress(valor, desc=desc)
+            except Exception:
+                pass
 
     if gemini_key and gemini_key.strip():
         os.environ["GEMINI_API_KEY"] = gemini_key.strip()
 
-    if not os.environ.get("GEMINI_API_KEY"):
-        banner = _banner_html(
-            "Falta GEMINI_API_KEY",
-            "Configura GEMINI_API_KEY en el archivo .env o ingrésala en el campo opcional.",
-            "err",
+    gal_items, vid_prev, gal_html, clips_prev = obtener_datos_galeria()
+    hist_filas, hist_html = obtener_tabla_historial()
+
+    titulos_fase = {
+        "audio": "Fase 1/4 en ejecución: Extracción de Audio",
+        "gemini": "Fase 2/4 en ejecución: Análisis Viral con Gemini IA",
+        "fuente": "Fase 3/4 en ejecución: Preparación de Fuente de Video",
+        "render": "Fase 3/4 en ejecución: Renderizado Vertical 9:16 con FFmpeg",
+        "youtube": "Fase 4/4 en ejecución: Subida a YouTube Shorts",
+        "completado": "¡Pipeline Kicksazos Completado con Éxito!",
+        "error": "Alerta de Ejecución en el Pipeline",
+    }
+
+    for estado in ejecutar_pipeline_completo(
+        url=url,
+        modelo_preferido=modelo_preferido,
+        solo_analisis=solo_analisis,
+        subir_youtube=subir_auto_yt,
+        publish_at_inicio=(publish_at_inicio or "").strip() or None,
+        intervalo_horas=intervalo_horas or 0,
+        on_log=registrar_log,
+    ):
+        fase = estado.get("fase", "run")
+        progreso = float(estado.get("progreso", 0.0))
+        mensaje = str(estado.get("mensaje", ""))
+        clips_estado = estado.get("clips") or clips_prev
+        ultimo_video = estado.get("ultimo_video")
+
+        _reportar_progreso(progreso, mensaje)
+
+        if fase in ("gemini", "youtube", "completado", "error") or ultimo_video:
+            gal_items, vid_gal, gal_html, _ = obtener_datos_galeria()
+            hist_filas, hist_html = obtener_tabla_historial()
+            if ultimo_video:
+                vid_prev = ultimo_video
+            elif vid_gal:
+                vid_prev = vid_gal
+
+        nivel = "err" if fase == "error" else ("ok" if fase == "completado" else "run")
+        titulo_banner = titulos_fase.get(fase, "Pipeline en Ejecución")
+        banner = _banner_html(titulo_banner, mensaje, nivel)
+
+        yield (
+            banner,
+            "\n".join(logs),
+            vid_prev,
+            clips_estado,
+            gal_items,
+            gal_html,
+            hist_filas,
+            hist_html,
         )
-        yield banner, log("ERROR: GEMINI_API_KEY no encontrada."), vid_prev, clips_prev, gal_items, gal_html, hist_filas, hist_html
-        return
-
-    ctx = crear_contexto_job(url_limpia)
-    log(f"Iniciando Job {ctx.job_id} en {ctx.job_dir}")
-
-    audio_temp = None
-    fuente_local = None
-
-    try:
-        # FASE 1: Extracción de audio en su job_dir
-        progress(0.08, desc="Fase 1/4: Extrayendo pista de audio ligera con yt-dlp...")
-        banner = _banner_html(
-            "Fase 1/4 en ejecución: Extracción de Audio",
-            f"Descargando y comprimiendo audio mono 16kHz desde: <code>{url_limpia}</code> en <code>jobs/{ctx.job_id}</code>",
-            "run",
-        )
-        yield banner, log(f"Iniciando extracción de audio para job {ctx.job_id} desde: {url_limpia}"), vid_prev, clips_prev, gal_items, gal_html, hist_filas, hist_html
-
-        audio_temp = extraer_audio(url_limpia, job_dir=ctx.job_dir)
-        duracion = obtener_duracion_media(audio_temp)
-        dur_str = segundos_a_hhmmss(duracion) if duracion else "Desconocida"
-        log(f"✓ Audio extraído correctamente ({audio_temp}) | Duración: {dur_str}")
-
-        # FASE 2: Inferencia con Gemini
-        progress(0.30, desc=f"Fase 2/4: Analizando narrativa viral con {modelo_preferido}...")
-        banner = _banner_html(
-            "Fase 2/4 en ejecución: Análisis Viral con Gemini IA",
-            f"Subiendo audio a File API (polling hasta ACTIVE) y detectando hooks/polémica colombiana con cascada liderada por <code>{modelo_preferido}</code>...",
-            "run",
-        )
-        yield banner, "\n".join(logs), vid_prev, clips_prev, gal_items, gal_html, hist_filas, hist_html
-
-        clips = analizar_con_gemini(
-            audio_temp,
-            duracion_total=duracion,
-            modelo_preferido=modelo_preferido,
-            job_dir=ctx.job_dir,
-        )
-        log(f"✓ Gemini detectó {len(clips)} clips virales con metadatos SEO completos.")
-        for c in clips:
-            log(
-                f"  • Clip #{c['id']}: {c['titulo']} [{c['inicio']} -> {c['fin']}] | Hook: {c['gancho'][:45]}..."
-            )
-
-        if solo_analisis:
-            progress(1.0, desc="¡Análisis completado!")
-            gal_items, vid_prev, gal_html, _ = obtener_datos_galeria()
-            banner = _banner_html(
-                "Análisis Viral Completado (Modo Solo Análisis)",
-                f"Se generaron {len(clips)} propuestas con SEO en <code>jobs/{ctx.job_id}/clips.json</code> y <code>clips.json</code>.",
-                "ok",
-            )
-            yield banner, "\n".join(logs), vid_prev, clips, gal_items, gal_html, hist_filas, hist_html
-            return
-
-        # FASE 3: Descarga base y Renderizado FFmpeg 9:16
-        progress(0.55, desc="Fase 3/4: Preparando fuente de video en 1080p...")
-        banner = _banner_html(
-            "Fase 3/4 en ejecución: Renderizado Vertical 9:16 con FFmpeg",
-            "Aplicando fast-seek (-ss antes de -i), fondo 360p con boxblur, encuadre central y marca de agua @Kicksazos...",
-            "run",
-        )
-        yield banner, log("Preparando fuente de video para corte local rápido..."), vid_prev, clips, gal_items, gal_html, hist_filas, hist_html
-
-        if duracion is None or duracion <= 3600:
-            try:
-                destino_fuente = ctx.job_dir / "temp_source.mp4"
-                fuente_local = descargar_video_fuente(url_limpia, destino=destino_fuente)
-                log(f"✓ Video fuente descargado en {fuente_local}")
-            except Exception as e:
-                log(f"[AVISO] Se usará seek remoto directo ({e})")
-                fuente_local = None
-
-        entrada_render = fuente_local or url_limpia
-
-        youtube_client = None
-        if subir_auto_yt:
-            log("Autenticando cliente de YouTube Data API v3 (token.json)...")
-            try:
-                youtube_client = autenticar_youtube(interactivo=False)
-                log("✓ Autenticación con YouTube exitosa.")
-            except Exception as e:
-                log(f"[AVISO] No se pudo autenticar YouTube ({e}). Se continuará con renderizado local.")
-                youtube_client = None
-
-        total_clips = len(clips)
-        for idx, clip in enumerate(clips, start=1):
-            cid = clip.get("id")
-            frac = 0.60 + (0.35 * (idx - 1) / max(1, total_clips))
-            progress(frac, desc=f"Renderizando Clip #{cid}/{total_clips}: {clip.get('titulo')}...")
-            yield banner, log(
-                f"Renderizando Clip #{cid} ({clip.get('inicio')} -> {clip.get('fin')})..."
-            ), vid_prev, clips, gal_items, gal_html, hist_filas, hist_html
-
-            ruta_clip = procesar_clip_ffmpeg(
-                entrada_render,
-                clip.get("inicio"),
-                clip.get("fin"),
-                cid,
-                job_id=ctx.job_id,
-                subtitulos=clip.get("subtitulos"),
-                job_dir=ctx.job_dir,
-            )
-            clip["archivo_local"] = ruta_clip
-            log(f"✓ Clip #{cid} renderizado en: {ruta_clip}")
-
-            if subir_auto_yt and youtube_client is not None:
-                progress(
-                    frac + (0.15 / max(1, total_clips)),
-                    desc=f"Subiendo Clip #{cid} a YouTube Shorts (Privado)...",
-                )
-                yield _banner_html(
-                    f"Fase 4/4: Subiendo Clip #{cid} a YouTube Shorts (Privado)",
-                    f"Inyectando SEO: <strong>{clip.get('titulo')}</strong> | Categoría 24 | madeForKids=False",
-                    "run",
-                ), log(f"Subiendo {os.path.basename(ruta_clip)} a YouTube en privado..."), ruta_clip, clips, gal_items, gal_html, hist_filas, hist_html
-
-                try:
-                    info_yt = subir_short(
-                        youtube=youtube_client,
-                        ruta_video=ruta_clip,
-                        titulo=clip.get("titulo", f"Clip {cid}"),
-                        descripcion=clip.get("descripcion", ""),
-                        etiquetas=clip.get("etiquetas", []),
-                        privacidad="private",
-                        clip_id=cid,
-                        guardar_registro=True,
-                    )
-                    clip["youtube_id"] = info_yt["youtube_id"]
-                    clip["youtube_url"] = info_yt["url"]
-                    clip["youtube_status"] = "Subido (Privado)"
-                    log(f"✓ Subido a YouTube Shorts: {info_yt['url']}")
-                except Exception as e:
-                    clip["youtube_status"] = f"Error subida ({str(e)[:60]})"
-                    log(f"[AVISO] Falló subida a YouTube para Clip #{cid}: {e}")
-            elif not subir_auto_yt:
-                clip["youtube_status"] = "Subida desactivada por usuario"
-            else:
-                clip["youtube_status"] = "Local (Sin token activo)"
-
-        _guardar_y_sincronizar_clips(clips, job_dir=ctx.job_dir)
-
-        progress(1.0, desc="¡Pipeline E2E completado con éxito!")
-        gal_items, vid_prev, gal_html, _ = obtener_datos_galeria()
-        hist_filas, hist_html = obtener_tabla_historial()
-
-        subidos_ok = sum(1 for c in clips if c.get("youtube_url"))
-        banner_final = _banner_html(
-            "¡Pipeline Kicksazos Completado con Éxito!",
-            f"Job: <code>{ctx.job_id}</code>. Se renderizaron <strong>{len(clips)} clips verticales 9:16</strong> en <code>clips_finales/</code> "
-            f"y se subieron <strong>{subidos_ok} videos en privado</strong> a YouTube Shorts.",
-            "ok",
-        )
-        yield banner_final, log(f"✓ Flujo E2E finalizado sin errores para job {ctx.job_id}."), vid_prev, clips, gal_items, gal_html, hist_filas, hist_html
-
-    except Exception as e:
-        gal_items, vid_prev, gal_html, clips_prev = obtener_datos_galeria()
-        hist_filas, hist_html = obtener_tabla_historial()
-        banner_err = _banner_html(
-            "Alerta de Ejecución en el Pipeline",
-            f"Se produjo una excepción controlada: <code>{str(e)}</code>",
-            "err",
-        )
-        yield banner_err, log(f"[ERROR] {str(e)}"), vid_prev, clips_prev, gal_items, gal_html, hist_filas, hist_html
-    finally:
-        STREAM_URL_CACHE.invalidar(ctx.job_id)
-        if audio_temp and os.path.exists(audio_temp):
-            try:
-                os.remove(audio_temp)
-            except OSError:
-                pass
-        if fuente_local and os.path.exists(fuente_local):
-            try:
-                os.remove(fuente_local)
-            except OSError:
-                pass
 
 
 def seleccionar_clip_galeria(evt: gr.SelectData) -> Optional[str]:
@@ -755,6 +644,23 @@ def construir_interfaz() -> gr.Blocks:
                             type="password",
                         )
 
+                with gr.Accordion("📅 Programación de Publicación (Opcional)", open=False):
+                    with gr.Row():
+                        with gr.Column(scale=3):
+                            publish_at_input = gr.Textbox(
+                                label="Fecha y Hora Inicial (Hora Local Colombia -05:00)",
+                                placeholder="YYYY-MM-DD HH:MM (Hora local Colombia, vacío = privado inmediato)",
+                                lines=1,
+                            )
+                        with gr.Column(scale=2):
+                            intervalo_horas_input = gr.Slider(
+                                minimum=0,
+                                maximum=24,
+                                step=1,
+                                value=0,
+                                label="Intervalo entre Shorts (horas)",
+                            )
+
                 btn_ejecutar = gr.Button(
                     "⚡ EJECUTAR PIPELINE COMPLETO (AUDIO ➔ GEMINI ➔ FFMPEG 9:16 ➔ YOUTUBE)",
                     variant="primary",
@@ -823,9 +729,11 @@ def construir_interfaz() -> gr.Blocks:
                         "ID YouTube",
                         "URL Directa Short",
                         "Privacidad",
+                        "Programado (UTC)",
+                        "Cuenta ID",
                         "Tags Clave (Extracto)",
                     ],
-                    datatype=["str", "str", "str", "str", "str", "str", "str"],
+                    datatype=["html"] * 9,
                     value=filas_historial_init,
                     interactive=False,
                     wrap=True,
@@ -840,6 +748,8 @@ def construir_interfaz() -> gr.Blocks:
                 subir_yt_chk,
                 solo_analisis_chk,
                 api_key_input,
+                publish_at_input,
+                intervalo_horas_input,
             ],
             outputs=[
                 estado_banner,

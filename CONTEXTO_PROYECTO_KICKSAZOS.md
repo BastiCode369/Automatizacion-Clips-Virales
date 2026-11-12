@@ -1,6 +1,6 @@
 # CONTEXTO_PROYECTO_KICKSAZOS.md — System Context (Base de Conocimiento Maestra)
 
-> **Actualizado (Fase 2):** 2026-11-11 22:13 (-05:00) mediante implementación y pruebas en `~/clips_automation`.
+> **Actualizado (Fase 3):** 2026-11-11 23:55 (-05:00) mediante orquestador unificado, gestión de cuota, programación y sanitización HTML en `~/clips_automation`.
 > **Propósito:** que cualquier agente de IA entienda el código, el flujo de datos, los contratos y el estado real del sistema **sin explorar desde cero**.
 > **Fuente de verdad:** el código fuente. El archivo previo `Contexto y Objetivos del Proyecto Kicksazos.md` contiene afirmaciones **que no coinciden con el código** (ver §6.4).
 > **Seguridad:** todos los secretos aparecen como `<REDACTED>`. Nunca imprimir el contenido de `.env`, `client_secret.json`, `token.json` ni `token_cuenta_anterior.json`.
@@ -26,9 +26,9 @@
 
 1. Recibe una URL (VOD/stream/video de **Kick**, YouTube o Twitch) y crea un contexto aislado en `jobs/<job_id>/`.
 2. Extrae una pista de **audio mono 16 kHz / 32 kbps** directamente desde el stream (`yt-dlp -g` + `ffmpeg -vn` con reconexión), usando `yt-dlp` como fallback automático.
-3. Sube el audio a la **Gemini File API** y pide a un modelo Gemini (cascada con fallback) que detecte 3–6 momentos virales, devolviendo **timestamps + metadatos SEO + subtítulos sincronizados** en JSON estructurado (`clips.json`).
+3. Sube el audio a la **Gemini File API** y pide a un modelo Gemini (cascada con fallback y backoff con jitter real) que detecte 3–6 momentos virales, devolviendo **timestamps + metadatos SEO + subtítulos sincronizados** en JSON estructurado (`clips.json`).
 4. Renderiza cada momento en **vertical 9:16 (1080×1920)** con FFmpeg (acelerado por hardware **VAAPI** `h264_vaapi` en `/dev/dri/renderD128` con fallback automático a CPU `libx264`): fondo desenfocado + video centrado sin recorte + marca de agua adaptativa `assets/watermark.png` + subtítulos dinámicos quemados (`.ass`).
-5. Sube cada clip a **YouTube Shorts en privado** (YouTube Data API v3, OAuth instalado) y registra la trazabilidad en `subidas_shorts.json`.
+5. Sube cada clip a **YouTube Shorts** (privado inmediato o programado con `publishAt` ISO 8601 UTC, con control de cuota diaria ~6 uploads/24h, hash de canal/cuenta `cuenta_id` y reintentos resumables) y registra la trazabilidad en `subidas_shorts.json`.
 
 **Nicho objetivo:** clips IRL / streaming colombiano (Kick Colombia: WestCOL, Blessd, La Liendra, Yhap, eldomi, etc.). Canal destino: **Kicksazos**. Idioma: español coloquial colombiano.
 
@@ -36,8 +36,8 @@
 
 | Entrada | Comando | Uso |
 |---|---|---|
-| CLI E2E | `venv/bin/python pipeline_viral_clips.py "<URL>" [--solo-analisis] [--sin-subida] [--modelo <id>]` | Pipeline completo headless |
-| GUI Gradio | `venv/bin/python app_interfaz.py` → `http://127.0.0.1:7860` | Mismo pipeline con progreso, galería e historial |
+| CLI E2E | `venv/bin/python pipeline_viral_clips.py "<URL>" [--solo-analisis] [--sin-subida] [--modelo <id>] [--publish-at "YYYY-MM-DD HH:MM"] [--intervalo-horas <N>]` | Pipeline completo headless consumiendo el orquestador unificado |
+| GUI Gradio | `venv/bin/python app_interfaz.py` → `http://127.0.0.1:7860` | Mismo generador central con progreso en tiempo real, programación, galería e historial sanitizados |
 | Render manual de 1 clip | `venv/bin/python procesar_video_universal.py <URL\|archivo> <HH:MM:SS> <HH:MM:SS> <ID> [JOB_ID]` | Re-render puntual |
 | Upload de prueba | `venv/bin/python subir_shorts.py` | OAuth interactivo + sube el 1er `.mp4` de `clips_finales/` con metadatos de prueba |
 
@@ -253,44 +253,48 @@ legacy/{analizar_stream.py, recortar_clips.py, pipeline_viral_clips.py.bak} : au
 | `_limpiar_y_parsear_json` | `(texto, duracion_total) -> List[dict]` | Quita fences markdown, valida con pydantic (3 niveles de fallback), validación temporal, SEO y `subtitulos` | `ValueError` si no queda ningún clip |
 | `extraer_audio` | `(url, job_dir=None) -> str` | Streaming directo HLS con `yt-dlp -g` + `ffmpeg -vn` (`-reconnect*`); fallback automático a descarga `yt-dlp` | **Borra `temp_audio.*`** previos del `job_dir`; crea `temp_audio.mp3` |
 | `construir_prompt_viral` | `(duracion_total) -> str` | Prompt de curaduría con instrucciones de `subtitulos` relativos | — |
-| `analizar_con_gemini` | `(ruta_audio, duracion_total, modelo_preferido, job_dir=None) -> List[dict]` | Upload File API, polling, cascada de modelos en streaming, parseo | **Escribe `clips.json`** en `job_dir` y raíz; borra el archivo remoto; `sys.exit(1)` si falta API key |
+| `_esperar_con_jitter` | `(intento, base=3.0, max_espera=30.0, ...) -> float` | Backoff exponencial con jitter (`random.uniform`) y registro de modelo, código de error y espera | Bloquea el hilo durante el tiempo calculado |
+| `analizar_con_gemini` | `(ruta_audio, duracion_total, modelo_preferido, job_dir=None, on_log=None) -> List[dict]` | Upload File API, polling, cascada de modelos en streaming con jitter real, parseo | **Escribe `clips.json`** en `job_dir` y raíz; borra el archivo remoto |
 | `descargar_video_fuente` | `(url, destino=None) -> str` | Descarga completa ≤1080p MP4 | Crea `temp_source.mp4` en `job_dir` (lo borra si existía) |
 | `obtener_urls_stream` | `(url, job_id=None, forzar_recarga=False) -> List[str]` | `yt-dlp -g` con caché en memoria por `job_id` | Pobla `STREAM_URL_CACHE` |
 | `detectar_encoder_hardware` | `(device_path=VAAPI_DEVICE) -> str` | Verifica `/dev/dri/renderD128` y prueba codificación nula de 1 frame `h264_vaapi` con `lavfi` | Devuelve `"h264_vaapi"` o `"libx264"` sin lanzar excepciones |
 | `obtener_dimensiones_video` | `(fuente) -> Tuple[int,int]\|None` | Consulta `ffprobe` (ancho, alto, SAR, rotación) | — |
 | `procesar_clip_ffmpeg` | `(url_o_archivo, inicio, fin, id_clip, job_id=None, subtitulos=None, job_dir=None) -> str` | Render 9:16 VAAPI/CPU, corte exacto `-t`, watermark adaptativa, `.ass` quemados, refresh 403/410 y fallbacks | Crea `clips_finales/<job_id>_clip_<id>.mp4` y `job_dir/subs_<id>.ass` |
-| `renderizar_y_subir_clips` | `(url, clips, duracion_total, subir_youtube=True, job_id=None, job_dir=None) -> List[str]` | Orquesta fase 3+4 en CLI | Reescribe `clips.json` (v2); append en `subidas_shorts.json`; invalida caché y borra `temp_source.mp4` |
+| `calcular_publish_at_utc` | `(publish_at_inicio, indice_clip=0, intervalo_horas=0) -> str\|None` | Convierte fecha local Colombia (-05:00) o ISO sumando intervalo a UTC ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`) | — |
+| `ejecutar_pipeline_completo` | `(url, modelo_preferido, solo_analisis, subir_youtube, publish_at_inicio, intervalo_horas, on_log)` | **Orquestador único generador** que emite diccionarios de estado (`fase`, `progreso`, `mensaje`, `clips`, `ultimo_video`, `job_dir`, `error`) con tolerancia a fallos por clip | Orquesta todo el pipeline CLI/GUI |
+| `renderizar_y_subir_clips` | `(url, clips, ...) -> List[str]` | Wrapper compatible que delega en el orquestador unificado con persistencia incremental | Reescribe `clips.json` incrementalmente |
 | `renderizar_clips` | alias | Compatibilidad: `renderizar_y_subir_clips(..., subir_youtube=True, ...)` | — |
-| `main` | argparse | CLI: `url`, `--solo-analisis`, `--sin-subida`, `--modelo` | Crea `JobContext`; borra `temp_audio.mp3` en `finally` |
+| `main` | argparse | CLI: `url`, `--solo-analisis`, `--sin-subida`, `--modelo`, `--publish-at`, `--intervalo-horas` | Consume `ejecutar_pipeline_completo` |
 
 #### `app_interfaz.py` — GUI Gradio (ACTIVO)
 
 | Función | Responsabilidad |
 |---|---|
 | `CUSTOM_CSS` | Tema oscuro (fondo `#0f0f13`, acento violeta `#8b5cf6`, verde Kick `#53fc18`), clases `.kicksazos-header`, `.status-banner.{ok,warn,err,run}`, `.clip-card`, `.tag-pill` |
-| `_banner_html(titulo, detalle, nivel)` | HTML de estado con iconos ✅⚠️❌⚡ (**sin escape HTML** de `detalle`) |
+| `_sanitizar_url_href(url)` | Valida esquema http(s) y escapa URLs para atributos `href` seguros |
+| `_banner_html(titulo, detalle, nivel)` | HTML de estado con iconos ✅⚠️❌⚡ sanitizado con `html.escape()` |
 | `_cargar_clips_actuales()` | Lee `clips.json` (lista o `[]`) |
-| `_indexar_subidas_por_archivo()` | Dict `archivo → registro` desde `subidas_shorts.json` (el último registro con el mismo nombre gana) |
-| `construir_tarjetas_galeria_html(clips)` | Tarjetas con timestamps, hook, gatillo, descripción SEO, tags y link a YouTube. Si `clips` vacío: tarjetas por `.mp4` en `clips_finales/` |
-| `obtener_datos_galeria()` | → `(items_galeria[(ruta, leyenda)], primer_video, html_tarjetas, clips)`. Prioriza `clip_<id>.mp4` del último `clips.json`; si no, todos los mp4 por mtime desc |
-| `obtener_tabla_historial()` | → `(filas Dataframe, html resumen)` desde `subidas_shorts.json` en orden inverso |
-| `ejecutar_pipeline_gradio(url, modelo_preferido, subir_auto_yt, solo_analisis, gemini_key, progress)` | **Generador** que replica el pipeline CLI paso a paso emitiendo 8 outputs por `yield` (ver §4.5) |
+| `_indexar_subidas_por_archivo()` | Dict `archivo → registro` desde `subidas_shorts.json` |
+| `construir_tarjetas_galeria_html(clips)` | Tarjetas con timestamps, hook, gatillo, descripción SEO, tags y link a YouTube con sanitización estricta (`html.escape()`) |
+| `obtener_datos_galeria()` | → `(items_galeria[(ruta, leyenda)], primer_video, html_tarjetas, clips)` |
+| `obtener_tabla_historial()` | → `(filas Dataframe, html resumen)` desde `subidas_shorts.json` con escape HTML y estado de cuota 24h |
+| `ejecutar_pipeline_gradio(...)` | **Generador adaptador** que consume `ejecutar_pipeline_completo()` y actualiza barra de progreso, logs, vista previa y tablas en tiempo real |
 | `seleccionar_clip_galeria(evt: gr.SelectData)` | Extrae `path` del item seleccionado para el reproductor |
 | `obtener_tema_oscuro()` | `gr.themes.Soft(primary_hue="violet", secondary_hue="emerald", neutral_hue="slate")` + overrides |
-| `construir_interfaz()` | Construye `gr.Blocks` con 3 pestañas y conecta eventos |
-| `__main__` | `demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=False, allowed_paths=[clips_finales, assets], theme=..., css=...)` |
-
-> La GUI **no** llama a `renderizar_y_subir_clips`; reimplementa el bucle de render/subida inline para poder emitir progreso. Cualquier cambio en la lógica de orquestación debe replicarse en **ambos** lugares.
+| `construir_interfaz()` | Construye `gr.Blocks` con accordion de programación (`publish_at_input`, `intervalo_horas_input`), 3 pestañas y eventos |
+| `__main__` | `demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=False, ...)` |
 
 #### `subir_shorts.py` — YouTube (ACTIVO)
 
 | Función | Responsabilidad |
 |---|---|
-| `autenticar_youtube(interactivo=False)` | Carga `token.json` → refresca si expiró y hay `refresh_token` → si no hay token válido: con `interactivo=True` abre `InstalledAppFlow.run_local_server(port=0)`; con `False` lanza `RuntimeError`. Persiste el token y devuelve `build("youtube","v3")` |
-| `cargar_historial_subidas(ruta)` | Lee `subidas_shorts.json` → lista (o `[]` ante error) |
-| `registrar_subida(registro, ruta)` | Elimina registros con el mismo `youtube_id`, hace append y reescribe el JSON |
-| `subir_short(youtube, ruta_video, titulo, descripcion, etiquetas, privacidad="private", clip_id=None, guardar_registro=True)` | Normaliza metadatos, `videos().insert` resumable con `next_chunk()`, devuelve y registra `info_subida` |
-| `main()` | Exige `client_secret.json`, autentica **interactivo**, sube el primer `.mp4` (orden alfabético) de `clips_finales/` (o `clips_virales/`) con título/descripción/tags **de prueba** |
+| `autenticar_youtube(interactivo=False)` | Autentica con OAuth, refresca si expiró y asocia `_kicksazos_cuenta_id` al Resource |
+| `obtener_hash_cuenta(creds)` | Genera identificador seguro SHA-256 corto (`[:12]`) de la cuenta/canal a partir de tokens/clientId |
+| `verificar_cuota_diaria(limite_diario=6)` | Lee `subidas_shorts.json`, filtra subidas de las últimas 24h y valida si se alcanzó el límite diario |
+| `cargar_historial_subidas(ruta)` | Lee `subidas_shorts.json` → lista |
+| `registrar_subida(registro, ruta)` | Deduplica por `youtube_id`, append y reescribe JSON |
+| `subir_short(...)` | Sube resumable con hasta 4 reintentos ante HTTP 5xx / red usando backoff con jitter, soporta programación `publishAt` (ISO 8601 UTC) y registra `cuenta_id` y `publish_at` |
+| `main()` | CLI interactivo de upload de prueba |
 
 #### `procesar_video_universal.py` (ACTIVO, wrapper)
 `procesar_clip(url, inicio, fin, id_clip)` → `procesar_clip_ffmpeg(...)`. CLI: `python procesar_video_universal.py <URL|archivo> <INICIO> <FIN> <ID>`. No sube ni modifica JSON.
@@ -622,13 +626,15 @@ Resumen del resto: id2 `00:20:58→00:21:48` (50 s, W-ybt9xaGvU) · id3 `00:55:5
     "descripcion": "...\n¡Suscríbete a Kicksazos ...! #Shorts #Kicksazos #StreamColombia #KickColombia",
     "etiquetas": ["Kicksazos","StreamColombia","..."],
     "privacidad": "private",
+    "publish_at": "2026-11-12T23:00:00Z", // null o string ISO 8601 UTC si fue programado
+    "cuenta_id": "d4a8f9c21b3e",          // hash SHA-256 corto del refresh_token/client_id (sin exponer secretos)
     "categoryId": "24",
     "madeForKids": false,
     "fecha_subida": "2026-11-11T00:20:13"   // ISO local, sin zona horaria
   }
 ]
 ```
-**Contenido actual (7 registros):**
+**Contenido actual (7 registros históricos + nuevos registros enriquecidos):**
 
 | # | clip_id | archivo | youtube_id | fecha_subida | Observación |
 |---|---|---|---|---|---|
@@ -637,7 +643,7 @@ Resumen del resto: id2 `00:20:58→00:21:48` (50 s, W-ybt9xaGvU) · id3 `00:55:5
 | 3–6 | 2–5 | clip_2..5.mp4 | W-ybt9xaGvU, KZB9ToKaeaU, -Hd7i3Y4IUg, H-fGRr_ySXo | 00:45–00:48 | Cuenta anterior |
 | 7 | null | clip_1.mp4 | FJnV_odrhC4 | 2026-11-11T20:49:06 | **Prueba de la cuenta NUEVA** vía `subir_shorts.py` (título "¡Momento Épico en Vivo! 😂 #Shorts") |
 
-> ⚠️ El registro no guarda la cuenta/canal; tras el cambio OAuth, los IDs 1–6 pertenecen al canal anterior y el 7 al nuevo.
+> ✅ Desde la **Fase 3**, cada nuevo registro guarda `"cuenta_id"` (hash seguro SHA-256 de 12 chars derivado de las credenciales OAuth activas) y `"publish_at"` para distinguir analíticas entre canales y rastrear publicaciones diferidas. Además, `verificar_cuota_diaria()` inspecciona dinámicamente este archivo para no superar el límite de 6 subidas por ventana de 24h.
 
 ### 5.3 `clips_virales/reporte_clips.json` (LEGACY)
 ```json
@@ -747,16 +753,16 @@ Reconstruido a partir del código actual, el `.bak`, los scripts legacy, timesta
 4. `GEMINI_API_KEY` ingresada en la GUI muta `os.environ` de forma persistente para el proceso.
 
 **Robustez**
-5. Si **un** render FFmpeg falla definitivamente (`CalledProcessError` tras agotar fallbacks VAAPI/subs/403), se aborta el bucle completo y `clips.json` v2 **no** se escribe (las subidas ya hechas sí quedan en `subidas_shorts.json`).
-6. Sin límite de cuota YouTube en el pipeline activo (~6 uploads/día por proyecto). Sin reintentos en `next_chunk()`.
+5. [RESUELTO - FASE 3] Tolerancia a fallos por clip: si un clip individual falla en renderizado o subida, se captura en su propio bloque `try/except`, se actualizan `render_status` y `youtube_status`, se sincroniza `clips.json` incrementalmente y el lote continúa.
+6. [RESUELTO - FASE 3] Límite de cuota YouTube mitigado: `verificar_cuota_diaria(limite_diario=6)` omite subidas adicionales marcando `"Pendiente por cuota diaria (6/24h)"` antes de invocar la API. `next_chunk()` ahora tiene hasta 4 reintentos con backoff exponencial y jitter ante HTTP 5xx o errores de transporte.
 7. [RESUELTO - FASE 2] `obtener_urls_stream` y dimensiones de stream ahora se cachean en memoria por `job_id` en `STREAM_URL_CACHE`, con invalidación automática y reintento ante HTTP 403/410.
 8. [RESUELTO - FASE 2] `extraer_audio` extrae audio directamente desde el stream HLS con FFmpeg (`-vn -reconnect*`) evitando descargar el video muxed completo salvo fallback.
 9. [RESUELTO - FASE 2] `hhmmss_a_segundos` conserva fracciones decimales y `procesar_clip_ffmpeg` usa `-ss <inicio>` + `-t <duracion_clip>` para evitar desfases de cierre.
 10. [RESUELTO - FASE 2] Watermark posicionada dinámicamente con `ffprobe` (`y=60` en vertical 9:16 o `max(40, (H-h_fg)/2-h-24)` con barras desenfocadas).
-11. `analizar_con_gemini` usa `sys.exit(1)` (no apto para uso como librería).
-12. `_banner_html` interpola `str(e)` y metadatos sin escape HTML (riesgo menor de XSS local).
+11. [RESUELTO - FASE 3] `analizar_con_gemini` ya no utiliza `sys.exit(1)`; lanza excepciones descriptivas (`RuntimeError`) para integración segura como librería y orquestador.
+12. [RESUELTO - FASE 3] Sanitización HTML completa: `_banner_html`, `construir_tarjetas_galeria_html` y `obtener_tabla_historial` aplican `html.escape()` sobre todos los textos dinámicos de entrada y salida, eliminando riesgos XSS.
 13. Los IDs de modelo de `MODELOS_CANDIDATOS` deben mantenerse al día.
-14. La GUI duplica la lógica de orquestación de `renderizar_y_subir_clips` (candidato a unificación en Fase 3).
+14. [RESUELTO - FASE 3] Unificación de orquestación: `ejecutar_pipeline_completo()` es el generador centralizado consumido tanto por CLI `main()` como por Gradio `ejecutar_pipeline_gradio()`.
 15. El refresh token puede caducar (7 días si la app OAuth está en modo Testing).
 
 **Higiene del repo**
@@ -770,10 +776,10 @@ Reconstruido a partir del código actual, el `.bak`, los scripts legacy, timesta
 |---|---|---|
 | ✅ Hecho | **Fase 1: Higiene, Seguridad, Rutas y Jobs** | Git, `.gitignore`, `requirements.txt`, `BASE_DIR`, `crear_contexto_job()`, `legacy/` |
 | ✅ Hecho | **Fase 2: Red, VAAPI, Precisión y Subtítulos `.ass`** | Audio HLS directo con FFmpeg, caché de URLs + invalidación 403/410, `h264_vaapi` + fallback `libx264`, watermark adaptativa + `-t` exacto, `SegmentoSubtitulo` + `.ass` |
-| P1 | **Fase 3: Unificación de orquestación** | GUI y CLI llaman a un único motor/generador con callbacks de progreso |
-| P1 | **Fase 3: Tolerancia a fallos por clip** | `try/except` por render individual; persistencia incremental de `clips.json` |
-| P1 | **Fase 3: Gestor de cuota YouTube** | Contador diario en `subidas_shorts.json`; cola de pendientes; reintentos con backoff |
-| P2 | **Fase 3: Suite automatizada de tests (`pytest`)** | Cobertura continua para parsing JSON, validaciones de tiempo, `.ass`, caché y jobs |
+| ✅ Hecho | **Fase 3: Orquestación Unificada y Resiliencia** | Generador `ejecutar_pipeline_completo()`, tolerancia a fallos por clip, backoff con jitter real en Gemini |
+| ✅ Hecho | **Fase 3: Gestión de Cuota y Programación YouTube** | `verificar_cuota_diaria()`, identificador `cuenta_id`, reintentos en `next_chunk()`, parámetro `publishAt` y controles Gradio |
+| ✅ Hecho | **Fase 3: Seguridad y Sanitización HTML** | `html.escape()` en banners, tarjetas de galería, tabla de historial y enlaces dinámicos |
+| P2 | **Fase 4: Suite automatizada de tests (`pytest`)** | Cobertura continua para parsing JSON, validaciones de tiempo, `.ass`, caché y jobs |
 
 ---
 
