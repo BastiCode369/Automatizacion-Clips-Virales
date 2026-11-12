@@ -1,6 +1,6 @@
 # CONTEXTO_PROYECTO_KICKSAZOS.md — System Context (Base de Conocimiento Maestra)
 
-> **Actualizado (Fase 3):** 2026-11-11 23:55 (-05:00) mediante orquestador unificado, gestión de cuota, programación y sanitización HTML en `~/clips_automation`.
+> **Actualizado (Fase 3):** 2026-11-12 00:43 (-05:00) mediante purga de modelos Gemini obsoletos, aumento de tolerancia a 4 intentos y backoff ampliado ante 503/DNS en `~/clips_automation`.
 > **Propósito:** que cualquier agente de IA entienda el código, el flujo de datos, los contratos y el estado real del sistema **sin explorar desde cero**.
 > **Fuente de verdad:** el código fuente. El archivo previo `Contexto y Objetivos del Proyecto Kicksazos.md` contiene afirmaciones **que no coinciden con el código** (ver §6.4).
 > **Seguridad:** todos los secretos aparecen como `<REDACTED>`. Nunca imprimir el contenido de `.env`, `client_secret.json`, `token.json` ni `token_cuenta_anterior.json`.
@@ -227,7 +227,7 @@ legacy/{analizar_stream.py, recortar_clips.py, pipeline_viral_clips.py.bak} : au
 | Constante | Valor | Uso |
 |---|---|---|
 | `GEMINI_TIMEOUT_MS` | `600_000` | `http_options={"timeout": ...}` (milisegundos = 600 s) |
-| `MODELOS_CANDIDATOS` | `["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro-preview", "gemini-3.7-flash", "gemini-2.5-flash", "gemini-2.5-pro"]` | Orden de la cascada y opciones del dropdown Gradio |
+| `MODELOS_CANDIDATOS` | `["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite"]` | Orden de la cascada y opciones del dropdown Gradio |
 | `RUTA_MARCA_AGUA` | `BASE_DIR / "assets/watermark.png"` | Ruta absoluta anclada a `BASE_DIR` |
 | `CARPETA_SALIDA` | `BASE_DIR / "clips_finales"` | Salida de renders |
 | `CARPETA_JOBS` | `BASE_DIR / "jobs"` | Directorios aislados por `job_id` |
@@ -366,7 +366,7 @@ python -m yt_dlp --js-runtimes node --remote-components ejs:github \
 4. **Polling**: mientras `state != "ACTIVE"`: si `FAILED` → `RuntimeError`; `sleep(4)` + `files.get`; máx **150 iteraciones (~600 s)** → `TimeoutError`. Errores transitorios de `files.get` se registran y se reintenta.
 5. **Prompt**: `construir_prompt_viral(duracion_total)`.
 6. **Cascada de modelos**: `orden = [modelo_preferido] + MODELOS_CANDIDATOS sin duplicado`.
-7. Por modelo, **2 intentos** con `client.models.generate_content_stream(model, contents=[archivo_subido, prompt], config=GenerateContentConfig(response_mime_type="application/json", response_schema=list[ClipViral], temperature=0.35))`; concatena `chunk.text`.
+7. Por modelo, **4 intentos** con `client.models.generate_content_stream(model, contents=[archivo_subido, prompt], config=GenerateContentConfig(response_mime_type="application/json", response_schema=list[ClipViral], temperature=0.35))`; concatena `chunk.text`.
 8. Parseo con `_limpiar_y_parsear_json`; se añade `modelo_ia` a cada clip; se escribe `clips.json` en `job_dir` y raíz.
 9. `finally`: `client.files.delete(name=...)` (errores silenciados).
 
@@ -374,14 +374,14 @@ python -m yt_dlp --js-runtimes node --remote-components ejs:github \
 
 | Excepción | Condición | Acción |
 |---|---|---|
-| `ServerError` (5xx, p. ej. 503 overloaded) | — | Log "Servidor ocupado (503)", `sleep(5)`, siguiente intento (tras 2 → siguiente modelo) |
-| `APIError` | `code in (400, 404)` | Modelo no disponible/inválido → **salta al siguiente modelo inmediatamente** |
-| `APIError` | `code in (429, 503)` | Cuota/saturación → `sleep(5)`, reintenta |
+| `ServerError` (5xx, p. ej. 503 overloaded) | — | Backoff con jitter (`base=4.0s`, `max_espera=25.0s`), reintenta hasta 4 veces antes de saltar al siguiente modelo |
+| `APIError` | `code in (400, 404)` | Modelo no disponible/inválido → espera 0.0s y **salta al siguiente modelo inmediatamente** |
+| `APIError` | `code in (429, 503)` | Cuota/saturación → Backoff con jitter (`base=4.0s`, `max_espera=25.0s`), reintenta hasta 4 veces |
 | `APIError` | otro código | Log y **salta al siguiente modelo** |
-| `Exception` genérica | stream vacío, JSON inválido, validación temporal sin clips, red | `sleep(2)`, reintenta |
+| `Exception` genérica | fallos de red (`ConnectError`), DNS, stream vacío, JSON inválido | Backoff con jitter (`base=4.0s`, `max_espera=25.0s`), reintenta hasta 4 veces |
 | Todos los modelos agotados | `clips` vacío | `RuntimeError("No se pudo obtener una respuesta JSON válida de los modelos disponibles.")` |
 
-> No hay *exponential backoff con jitter* (a pesar de lo que dice el doc previo): las esperas son fijas (5 s / 2 s). Peor caso ≈ 6 modelos × 2 intentos × (latencia + 5 s).
+> El backoff exponencial con jitter (`_esperar_con_jitter`) utiliza `base=4.0` s y `max_espera=25.0` s para permitir que en los intentos 3 y 4 el sistema espere entre ~12 y 25 segundos, absorbiendo picos de saturación 503 en Google y micro-cortes de resolución DNS local.
 
 #### 4.2.3 Prompt de producción (resumen, `construir_prompt_viral`)
 
@@ -711,12 +711,13 @@ Reconstruido a partir del código actual, el `.bak`, los scripts legacy, timesta
 7. **Token OAuth en modo no interactivo** → el pipeline nunca abre navegador; si falla la auth, renderiza localmente y marca el estado.
 8. **Cambio de cuenta OAuth** (11-nov 20:47) → respaldo del token anterior y re-autorización interactiva con `subir_shorts.py`; `client_secret.json` (proyecto `kick-clips-auto-514009`) se mantuvo.
 9. **Cuello de botella en descarga secuencial HLS** → mitigado implementando concurrencia de fragmentos (`--concurrent-fragments 4`) y tolerancia a fallos (`--retries 5`, `--fragment-retries 5`) en yt-dlp para la extracción de audio, estabilizando la fluctuación de red y eliminando los valles de inactividad a 0 B/s.
+10. **Purga de modelos Gemini obsoletos (404) y resiliencia ante 503 / micro-cortes DNS** → Se verificaron los modelos reales mediante `client.models.list()`, confirmando que `gemini-2.5-flash`, `gemini-2.5-pro` y `gemini-3.1-pro-preview` están deprecados para `generateContent` (error 404). Se depuró `MODELOS_CANDIDATOS` manteniendo la terna activa (`gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.5-flash-lite`). Se aumentó la tolerancia a 4 intentos por modelo en `analizar_con_gemini` y se calibró el backoff con jitter a `base=4.0` s y `max_espera=25.0` s ante `ServerError` (503), `APIError` (429) y fallos transitorios de red (`ConnectError` / `OSError`), permitiendo pausas de 12–25 s en los intentos 3 y 4 para superar picos de saturación en Google y restablecimiento de resolución DNS.
 
 ### 6.4 Discrepancias del doc previo (`Contexto y Objetivos del Proyecto Kicksazos.md`) vs. código real
 
 | Afirmación del doc previo | Realidad en el código |
 |---|---|
-| "Exponential backoff con jitter" | Esperas fijas (5 s / 2 s); backoff lineal solo en el upload a File API (3 s·n) |
+| "Exponential backoff con jitter" | Implementado con jitter aleatorio real (`_esperar_con_jitter`) con base 4.0 s y techo 25.0 s para 503/429/red |
 | "Máscara de recorte previa para subtítulos incrustados" | No existe ningún filtro de máscara/crop de subtítulos |
 | "PyAV sustituido por subprocess con pipes asíncronos" | `subprocess.run` síncrono, sin pipes |
 | GUI: selector de nº de clips, tabla editable de timestamps, controles de blur/watermark/aspect, botón de descarga | No existen; la GUI tiene URL, modelo, 2 checkboxes, API key, logs, preview, galería e historial |

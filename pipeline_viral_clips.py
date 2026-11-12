@@ -38,11 +38,8 @@ ZONA_HORARIA_LOCAL = timezone(timedelta(hours=-5))  # Hora local Colombia (-05:0
 LIMITE_CUOTA_DIARIA_SHORTS = 6
 MODELOS_CANDIDATOS = [
     "gemini-3.8-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-pro-preview",
     "gemini-3.7-flash",
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
+    "gemini-3.5-flash-lite",
 ]
 RUTA_MARCA_AGUA = BASE_DIR / "assets" / "watermark.png"
 CARPETA_SALIDA = BASE_DIR / "clips_finales"
@@ -776,7 +773,7 @@ def analizar_con_gemini(
 
         clips: Optional[List[dict]] = None
         modelo_usado: Optional[str] = None
-        max_intentos = 2
+        max_intentos = 4
 
         for modelo in orden_modelos:
             _log(f"Probando análisis en streaming con: {modelo}...")
@@ -811,8 +808,8 @@ def analizar_con_gemini(
                     codigo_err = getattr(e, "code", None) or 503
                     _esperar_con_jitter(
                         intento,
-                        base=3.0,
-                        max_espera=30.0,
+                        base=4.0,
+                        max_espera=25.0,
                         on_log=on_log,
                         contexto=(
                             f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
@@ -831,8 +828,8 @@ def analizar_con_gemini(
                     if codigo_err in (429, 503):
                         _esperar_con_jitter(
                             intento,
-                            base=3.0,
-                            max_espera=30.0,
+                            base=4.0,
+                            max_espera=25.0,
                             on_log=on_log,
                             contexto=(
                                 f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
@@ -849,8 +846,8 @@ def analizar_con_gemini(
                     codigo_err = type(e).__name__
                     _esperar_con_jitter(
                         intento,
-                        base=2.0,
-                        max_espera=15.0,
+                        base=4.0,
+                        max_espera=25.0,
                         on_log=on_log,
                         contexto=(
                             f"[AVISO] Modelo {modelo} falló (error {codigo_err}, "
