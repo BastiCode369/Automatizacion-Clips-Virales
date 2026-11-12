@@ -133,7 +133,7 @@ class SegmentoSubtitulo(BaseModel):
 
 
 class ClipViral(BaseModel):
-    """Esquema estructurado de cada clip viral detectado por Gemini con SEO completo para YouTube Shorts."""
+    """Esquema estructurado de cada clip viral detectado por Gemini con SEO multiplataforma (YouTube Shorts + TikTok)."""
 
     id: int = Field(description="Identificador entero secuencial del clip (1, 2, 3...)")
     titulo: str = Field(
@@ -152,6 +152,15 @@ class ClipViral(BaseModel):
     )
     etiquetas: List[str] = Field(
         description="Lista de 8 a 12 tags SEO clave incluyendo nombres propios de involucrados y ecosistema streaming colombiano"
+    )
+    caption_tiktok: str = Field(
+        description="Caption para TikTok de máximo 150 caracteres optimizado para SEO semántico y diseñado para detonar comentarios."
+    )
+    hashtags_tiktok: List[str] = Field(
+        description="Lista de exactamente 3 a 5 hashtags estratégicos para TikTok mezclando nicho y alcance, sin spam."
+    )
+    gancho_visual_portada: str = Field(
+        description="Titular visual de portada de 4 a 6 palabras, impactante, pensado para los primeros 2 segundos de retención en TikTok."
     )
     subtitulos: List[SegmentoSubtitulo] = Field(
         default_factory=list,
@@ -244,6 +253,108 @@ def _normalizar_etiquetas(raw_tags: Any) -> List[str]:
             resultado.append(defecto)
 
     return resultado[:12]
+
+
+def _normalizar_caption_tiktok(
+    raw_caption: Any,
+    gancho_fallback: str = "",
+    titulo_fallback: str = "",
+) -> str:
+    """Garantiza un caption TikTok no vacío y <= 150 caracteres optimizado para comentarios."""
+    caption = re.sub(r"\s+", " ", str(raw_caption or "")).strip()
+    if not caption:
+        base = re.sub(r"\s+", " ", str(gancho_fallback or titulo_fallback or "")).strip()
+        if base:
+            caption = f"{base} — ¿Tú qué opinas? 👇"
+        else:
+            caption = "Momento épico en stream colombiano 🔥 ¿Tú qué opinas? 👇"
+    if len(caption) > 150:
+        caption = caption[:147].rstrip() + "..."
+    return caption
+
+
+def _normalizar_hashtags_tiktok(
+    raw_tags: Any,
+    etiquetas_fallback: Optional[List[str]] = None,
+) -> List[str]:
+    """Garantiza una lista limpia de entre 3 y 5 hashtags con prefijo # para TikTok."""
+    base_defaults = [
+        "#Kicksazos",
+        "#StreamColombia",
+        "#KickColombia",
+        "#IRLColombia",
+        "#ClipsVirales",
+    ]
+    if isinstance(raw_tags, list):
+        candidatos = raw_tags
+    elif isinstance(raw_tags, str):
+        candidatos = [t.strip() for t in re.split(r"[,;\s\n]+", raw_tags) if t.strip()]
+    else:
+        candidatos = []
+
+    resultado: List[str] = []
+    vistos = set()
+
+    def _agregar(raw_tag: Any) -> None:
+        cuerpo = re.sub(r"\s+", "", str(raw_tag or "").strip()).lstrip("#")
+        if not cuerpo:
+            return
+        tag_fmt = f"#{cuerpo}"
+        clave = tag_fmt.lower()
+        if clave not in vistos:
+            vistos.add(clave)
+            resultado.append(tag_fmt)
+
+    for tag in candidatos:
+        _agregar(tag)
+
+    if len(resultado) < 3 and etiquetas_fallback:
+        for et in etiquetas_fallback:
+            if len(resultado) >= 4:
+                break
+            cuerpo_et = re.sub(r"\s+", "", str(et or "").strip()).lstrip("#")
+            if cuerpo_et.lower() in {"shorts", "youtubeshorts", "youtube"}:
+                continue
+            _agregar(cuerpo_et)
+
+    for defecto in base_defaults:
+        if len(resultado) >= 3:
+            break
+        _agregar(defecto)
+
+    return resultado[:5]
+
+
+def _normalizar_gancho_portada(
+    raw_gancho: Any,
+    titulo_fallback: str = "",
+    gancho_fallback: str = "",
+) -> str:
+    """Garantiza un titular visual de portada de 4 a 6 palabras para TikTok."""
+    texto = re.sub(r"\s+", " ", str(raw_gancho or "")).strip()
+    palabras = texto.split()
+
+    if not palabras:
+        fuente = re.sub(
+            r"[\U00010000-\U0010FFFF\u2600-\u27BF\uFE0F\u200D]+",
+            "",
+            str(titulo_fallback or gancho_fallback or ""),
+        ).strip()
+        palabras = [p for p in fuente.split() if any(ch.isalnum() for ch in p)]
+
+    if len(palabras) > 6:
+        palabras = palabras[:6]
+
+    if len(palabras) < 4:
+        if not palabras:
+            palabras = ["ESTO", "PASÓ", "EN", "STREAM", "VIVO"]
+        else:
+            for extra in ("EN", "VIVO", "SIN", "FILTRO"):
+                if len(palabras) >= 4:
+                    break
+                palabras.append(extra)
+
+    return " ".join(palabras[:6])
 
 
 def _normalizar_subtitulos(
@@ -352,7 +463,7 @@ def generar_archivo_ass(
             "",
             "[V4+ Styles]",
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            "Style: Default,DejaVu Sans,58,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,2,60,60,480,1",
+            "Style: Default,DejaVu Sans,58,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,2,60,238,672,1",
             "",
             "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -459,6 +570,20 @@ def _limpiar_y_parsear_json(
             desc_raw = f"{desc_raw}\n#Shorts #Kicksazos #StreamColombia"
 
         etiquetas_norm = _normalizar_etiquetas(item.get("etiquetas"))
+        caption_tiktok_norm = _normalizar_caption_tiktok(
+            item.get("caption_tiktok"),
+            gancho_fallback=gancho_raw,
+            titulo_fallback=titulo_raw,
+        )
+        hashtags_tiktok_norm = _normalizar_hashtags_tiktok(
+            item.get("hashtags_tiktok"),
+            etiquetas_fallback=etiquetas_norm,
+        )
+        gancho_portada_norm = _normalizar_gancho_portada(
+            item.get("gancho_visual_portada"),
+            titulo_fallback=titulo_raw,
+            gancho_fallback=gancho_raw,
+        )
         subtitulos_norm = _normalizar_subtitulos(item.get("subtitulos"), duracion_clip)
 
         clip_validado = ClipViral(
@@ -470,6 +595,9 @@ def _limpiar_y_parsear_json(
             razon_viral=razon_raw,
             descripcion=desc_raw,
             etiquetas=etiquetas_norm,
+            caption_tiktok=caption_tiktok_norm,
+            hashtags_tiktok=hashtags_tiktok_norm,
+            gancho_visual_portada=gancho_portada_norm,
             subtitulos=subtitulos_norm,
         )
         clips_validos.append(
@@ -605,66 +733,29 @@ def extraer_audio(url: str, job_dir: Optional[Path | str] = None) -> str:
 
 
 def construir_prompt_viral(duracion_total: Optional[float] = None) -> str:
-    """Construye el prompt especializado en retención de Shorts y ecosistema streaming colombiano."""
+    """Construye el prompt multiplataforma (YouTube Shorts + TikTok 2026) para el ecosistema streaming colombiano."""
     info_duracion = (
-        f"\nDURACIÓN TOTAL DEL AUDIO: {segundos_a_hhmmss(duracion_total)} (jamás generes timestamps superiores a este límite).\n"
+        f"\nDURACIÓN TOTAL DEL AUDIO: {segundos_a_hhmmss(duracion_total)} (jamás generes timestamps superiores a este límite)."
         if duracion_total
         else ""
     )
-    return f"""
-Actúa como un Senior Growth Hacker, estratega de retención de algoritmo de YouTube Shorts / TikTok y editor experto en el ecosistema de IRL y streaming de Latinoamérica (específicamente Colombia).
+    return f"""Actúa como un Senior Growth Hacker, estratega de algoritmo de YouTube Shorts / TikTok (2026) y editor experto en el ecosistema de IRL y streaming de Colombia (WestCOL, MrStivenTC, Blessd, La Liendra, Yhap, eldomi, eventos IRL y polémicas).
 
-Tu misión es analizar el audio adjunto y detectar los segmentos con mayor potencial de viralidad explosiva y retención (watch time > 100%).
-{info_duracion}
-### 1. MENTALIDAD DE INFERENCIA Y ALGORITMO DE SHORTS:
-- **Hook Explosivo (Primeros 2 segundos):** El clip DEBE abrir de golpe en medio de una frase picante, confesión, grito, cifra escandalosa, pregunta incisiva o momento de alta tensión. Cero introducciones lentas ni saludos.
-- **Ritmo Dinámico:** Evita segmentos con silencios muertos o divagaciones sin rumbo.
-- **Arco Narrativo Completo:** Todo clip debe tener apertura fuerte (hook), desarrollo rápido, clímax narrativo y una resolución o remate contundente (punchline/reacción final).
+Analiza el audio adjunto y detecta los segmentos con mayor potencial de viralidad.{info_duracion}
 
-### 2. CONTEXTO CULTURAL Y ECOSISTEMA STREAMING COLOMBIANO:
-Presta máxima atención y prioriza cualquier mención directa, indirecta, tiradera o anécdota sobre:
-- **Personalidades y Streamers:** WestCOL, Blessd (El Bendito), JH de la Cruz, MrStiven (Stiven Tangarife), Daiky Gamboa, La Liendra, Kris R, Ryan Castro, Pelicanger, Barbossa, Cossio, Aida Victoria, streamers de Kick/Twitch Colombia y escena urbana de Medellín, Cali y Bogotá.
-- **Gatillos Virales de Alta Retención:**
-  * Cifras de dinero, apuestas, deudas, compras o gastos extravagantes.
-  * Discusiones en vivo, tiraderas, reclamos, filtraciones o peleas.
-  * Confesiones íntimas, anécdotas callejeras, momentos incómodos en IRL o revelaciones personales.
-  * Humor negro contextual, jerga colombiana auténtica (gonorrea, nea, parce, visaje, etc.) y opiniones controversiales sobre figuras públicas o eventos.
+### 1. REGLA DEL PRIMER SEGUNDO Y RETENCIÓN:
+- Abre inmediatamente en el pico de tensión o curiosidad para vencer la tasa de deslizamiento (swipe-away rate).
+- Exige dinamismo y contexto que aporten valor transformativo (políticas de contenido original).
+- Estructura de Bucle (Seamless Loop): El final de la idea debe reconectar narrativa o contextualmente con la primera frase para detonar re-visualizaciones automáticas.
 
-### 3. DURACIÓN DINÁMICA E INTELIGENTE (SIN CORTES RÍGIDOS):
-- NO apliques una restricción rígida de corte fijo (nunca cortes a los 30s exactos si la historia sigue).
-- La duración debe adaptarse de forma natural e inteligente a la unidad narrativa completa (típicamente entre **25 y 75 segundos**; o proporcional si el video fuente completo es un clip corto).
-- Asegúrate de que el timestamp `inicio` abra exactamente en el gancho y el timestamp `fin` cierre después del remate, sin dejar palabras ni ideas cortadas a la mitad.
+### 2. DURACIÓN ESTRATÉGICA DUAL:
+- Prioriza dos rangos exactos: 22-45 segundos (máxima retención en Shorts) o 60-75 segundos (Arcos narrativos completos para TikTok Creator Rewards). Jamás cortes ideas abruptamente.
 
-### 4. METADATOS SEO Y SUBTÍTULOS DINÁMICOS OBLIGATORIOS POR CLIP:
-Por cada clip seleccionado (extrae entre 3 y 6 de los mejores momentos, o los mejores disponibles según la longitud del audio), devuelve en el JSON:
-- `id`: Entero secuencial (1, 2, 3...).
-- `titulo`: Título magnético de alto CTR, **máximo 60 caracteres**, en español coloquial/streamer (usa mayúsculas estratégicas o emojis puntuales).
-- `inicio`: Timestamp exacto `HH:MM:SS`.
-- `fin`: Timestamp exacto `HH:MM:SS`.
-- `gancho`: Transcripción textual de las primeras palabras que abren el clip.
-- `razon_viral`: Explicación concisa del gatillo psicológico/viral y por qué retendrá a la audiencia.
-- `descripcion`: Resumen corto de **2 líneas** que enganche al espectador + llamado a la acción (CTA) claro de suscripción al canal Kicksazos + 3 a 5 hashtags estratégicos (ej. `#Shorts #Kicksazos #StreamColombia #KickColombia`).
-- `etiquetas`: Lista de **8 a 12 tags SEO** clave (incluyendo nombres propios de los involucrados, nicho IRL, streaming Colombia, etc.).
-- `subtitulos`: Lista cronológica de frases cortas e impactantes (máximo **4 a 6 palabras** por segmento, texto limpio sin emojis) transcribiendo fielmente lo hablado en el clip, sincronizadas en segundos relativos (`inicio_rel`, `fin_rel` como decimales desde `0.0` hasta la duración exacta `fin - inicio`), sin solaparse entre sí.
-
-Devuelve EXCLUSIVAMENTE un arreglo JSON válido con esta estructura exacta:
-[
-  {{
-    "id": 1,
-    "titulo": "Título magnético máx 60 chars",
-    "inicio": "HH:MM:SS",
-    "fin": "HH:MM:SS",
-    "gancho": "Primeras palabras textuales del hook",
-    "razon_viral": "Explicación del gatillo de retención",
-    "descripcion": "Línea 1 de contexto viral.\\nLínea 2 con CTA: ¡Suscríbete a Kicksazos para más clips! #Shorts #Kicksazos #StreamColombia #KickColombia",
-    "etiquetas": ["Shorts", "Kicksazos", "StreamColombia", "WestCOL", "KickColombia", "IRLColombia", "ClipsVirales", "Polémica"],
-    "subtitulos": [
-      {{"inicio_rel": 0.0, "fin_rel": 1.8, "texto": "¡NO PUEDE SER ESTO!"}},
-      {{"inicio_rel": 1.9, "fin_rel": 4.2, "texto": "Mira lo que dijo en vivo"}}
-    ]
-  }}
-]
-"""
+### 3. METADATOS SEPARADOS Y OBLIGATORIOS POR CLIP:
+- YouTube Shorts: `titulo` (máx 60 chars), `descripcion` (2 líneas + CTA + #Shorts), `etiquetas` (8-12 tags SEO).
+- TikTok: `caption_tiktok` (máx 150 chars optimizado para SEO semántico), `hashtags_tiktok` (3 a 5 tags exactos mezclando nicho y alcance, cero spam), `gancho_visual_portada` (titular de 4-6 palabras).
+- Común: `id`, `inicio`/`fin` (HH:MM:SS), `gancho`, `razon_viral`.
+- `subtitulos`: lista cronológica de frases (máx 4-6 palabras, SIN EMOJIS) con `inicio_rel` y `fin_rel` en segundos, sin solapamientos."""
 
 
 def _guardar_y_sincronizar_clips(clips: List[dict], job_dir: Optional[Path | str] = None):
@@ -1030,16 +1121,16 @@ def obtener_dimensiones_video(fuente: str) -> Optional[Tuple[int, int]]:
 
 
 def _calcular_y_watermark(dimensiones: Optional[Tuple[int, int]]) -> str:
-    """Calcula la expresión Y adaptativa para centrar la marca de agua sin invadir el video."""
+    """Calcula la expresión Y adaptativa para centrar la marca de agua respetando la Safe Zone superior (y>=200)."""
     if dimensiones and dimensiones[0] > 0 and dimensiones[1] > 0:
         w, h = dimensiones
         aspecto = w / h
         if aspecto <= (9.0 / 16.0) + 0.03:
-            return "60"
+            return "200"
         h_fg = min(1920, int(round(1080 * h / w)))
     else:
         h_fg = 608
-    return f"max(40\\,(H-{h_fg})/2-h-24)"
+    return f"max(200\\,(H-{h_fg})/2-h-24)"
 
 
 def _escapar_ruta_ffmpeg_filtro(ruta: str | Path) -> str:

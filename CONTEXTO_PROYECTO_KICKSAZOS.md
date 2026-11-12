@@ -1,6 +1,6 @@
 # CONTEXTO_PROYECTO_KICKSAZOS.md — System Context (Base de Conocimiento Maestra)
 
-> **Actualizado (Fase 3):** 2026-11-12 00:43 (-05:00) mediante purga de modelos Gemini obsoletos, aumento de tolerancia a 4 intentos y backoff ampliado ante 503/DNS en `~/clips_automation`.
+> **Actualizado (v3 Multiplataforma):** 2026-11-12 01:35 (-05:00) mediante evolución a esquema multiplataforma YouTube Shorts + TikTok v3, motor de curaduría 2026, Safe Zones 9:16 FFmpeg/ASS y tarjetas duales copiables en Gradio en `~/clips_automation`.
 > **Propósito:** que cualquier agente de IA entienda el código, el flujo de datos, los contratos y el estado real del sistema **sin explorar desde cero**.
 > **Fuente de verdad:** el código fuente. El archivo previo `Contexto y Objetivos del Proyecto Kicksazos.md` contiene afirmaciones **que no coinciden con el código** (ver §6.4).
 > **Seguridad:** todos los secretos aparecen como `<REDACTED>`. Nunca imprimir el contenido de `.env`, `client_secret.json`, `token.json` ni `token_cuenta_anterior.json`.
@@ -386,32 +386,30 @@ python -m yt_dlp --js-runtimes node --remote-components ejs:github \
 #### 4.2.3 Prompt de producción (resumen, `construir_prompt_viral`)
 
 ```text
-Actúa como un Senior Growth Hacker, estratega de retención de algoritmo de YouTube Shorts / TikTok y editor experto en el ecosistema de IRL y streaming de Latinoamérica (específicamente Colombia).
+Actúa como un Senior Growth Hacker, estratega de algoritmo de YouTube Shorts / TikTok (2026) y editor experto en el ecosistema de IRL y streaming de Colombia (WestCOL, MrStivenTC, Blessd, La Liendra, Yhap, eldomi, eventos IRL y polémicas).
 
-Tu misión es analizar el audio adjunto y detectar los segmentos con mayor potencial de viralidad explosiva y retención (watch time > 100%).
-[Si hay duración:] DURACIÓN TOTAL DEL AUDIO: HH:MM:SS (jamás generes timestamps superiores a este límite).
+Analiza el audio adjunto y detecta los segmentos con mayor potencial de viralidad.
+[Si hay duración:] DURACIÓN TOTAL DEL AUDIO: {info_duracion} (jamás generes timestamps superiores a este límite).
 
-### 1. MENTALIDAD DE INFERENCIA Y ALGORITMO DE SHORTS:
-- Hook Explosivo (Primeros 2 segundos), Ritmo Dinámico, Arco Narrativo Completo.
+### 1. REGLA DEL PRIMER SEGUNDO Y RETENCIÓN:
+- Pico de tensión o curiosidad inmediato (vencer swipe-away rate), valor transformativo y Estructura de Bucle (Seamless Loop).
 
-### 2. CONTEXTO CULTURAL Y ECOSISTEMA STREAMING COLOMBIANO:
-- Streamers y personalidades (WestCOL, Blessd, JH, MrStiven, etc.) y gatillos virales.
+### 2. DURACIÓN ESTRATÉGICA DUAL:
+- Dos rangos exactos: 22-45 segundos (Shorts) o 60-75 segundos (TikTok Creator Rewards), sin cortes abruptos.
 
-### 3. DURACIÓN DINÁMICA E INTELIGENTE (SIN CORTES RÍGIDOS):
-- Entre 25 y 75 segundos (o proporcional en videos cortos), sin cortar ideas a la mitad.
-
-### 4. METADATOS SEO Y SUBTÍTULOS DINÁMICOS OBLIGATORIOS POR CLIP:
-- `id`, `titulo` (máx 60 chars), `inicio`/`fin` (`HH:MM:SS`), `gancho`, `razon_viral`, `descripcion` (2 líneas + CTA + hashtags), `etiquetas` (8–12 tags SEO).
-- `subtitulos`: lista cronológica de frases cortas (máx 4–6 palabras, sin emojis) con `inicio_rel` y `fin_rel` en segundos relativos `[0.0 .. fin-inicio]`, sin solapamientos.
+### 3. METADATOS SEPARADOS Y OBLIGATORIOS POR CLIP:
+- YouTube Shorts: `titulo` (máx 60 chars), `descripcion` (2 líneas + CTA + #Shorts), `etiquetas` (8-12 tags SEO).
+- TikTok: `caption_tiktok` (máx 150 chars SEO semántico), `hashtags_tiktok` (3 a 5 tags), `gancho_visual_portada` (4-6 palabras).
+- Común: `id`, `inicio`/`fin` (`HH:MM:SS`), `gancho`, `razon_viral`, `subtitulos` (máx 4-6 palabras, SIN EMOJIS, `inicio_rel`/`fin_rel` sin solapamientos).
 ```
 *(El texto literal completo está en `construir_prompt_viral` dentro de [pipeline_viral_clips.py](file:///home/bastiboy/clips_automation/pipeline_viral_clips.py).)*
 
-> Nota: los clips de YouTube Shorts admiten hasta 3 min, pero el prompt sugiere 25–75 s. Las restricciones (máx 60 chars, 8–12 tags, 3–6 clips, rango de subtítulos) **no** se imponen vía JSON Schema; se normalizan en post-proceso.
+> Nota: Gemini recibe `response_schema=list[ClipViral]` y `response_mime_type="application/json"`. Las restricciones de longitud/conteo (`<= 60` chars, `<= 150` chars, 3–5 hashtags TikTok, 4–6 palabras portada, 8–12 tags SEO, subtítulos sin solape) se normalizan y garantizan en post-proceso.
 
 #### 4.2.4 Parsing y validación — `_limpiar_y_parsear_json(texto, duracion_total)`
 1. Quita los fences markdown iniciales/finales (triple backtick con o sin `json`) mediante regex.
 2. Intenta `TypeAdapter(List[ClipViral]).validate_json(texto)`.
-3. Si falla: regex `\[.*\]` (DOTALL) → `validate_json(bloque)` → si falla, `json.loads(bloque)` (sin validación de tipos). Sin coincidencia: `json.loads(texto)`.
+3. Si falla (incluyendo archivos `clips.json` v1/v2 sin campos TikTok): regex `\[.*\]` (DOTALL) → `validate_json(bloque)` → si falla, `json.loads(bloque)`. Sin coincidencia: `json.loads(texto)`.
 4. Si es `dict` → toma `datos["clips"]`.
 5. Por cada item:
    - Convierte `inicio`/`fin` a segundos (si falla → descarta).
@@ -419,7 +417,10 @@ Tu misión es analizar el audio adjunto y detectar los segmentos con mayor poten
    - Si `fin − ini < 5 s` → descarta.
    - `titulo` > 60 chars → recorta a 57 + `"..."`; vacío → `"Clip Viral #n"`.
    - `descripcion` vacía → plantilla `"{gancho|titulo}\n¡Suscríbete a Kicksazos ...! #Shorts #Kicksazos #StreamColombia #KickColombia"`; si no contiene `#shorts` → añade `"\n#Shorts #Kicksazos #StreamColombia"`.
-   - `etiquetas` → `_normalizar_etiquetas` (defaults: `Shorts, Kicksazos, StreamColombia, KickColombia, ClipsVirales, IRLColombia, StreamersColombianos, PolémicaStream, WestCOL, YouTubeShorts`).
+   - `etiquetas` → `_normalizar_etiquetas` (8–12 tags sin `#`).
+   - `caption_tiktok` → `_normalizar_caption_tiktok` (≤150 chars; autogenera fallback con `gancho`/`titulo` + CTA de comentarios si falta).
+   - `hashtags_tiktok` → `_normalizar_hashtags_tiktok` (3–5 hashtags con `#`; si faltan en v1/v2 reutiliza tags relevantes de `etiquetas` + defaults TikTok).
+   - `gancho_visual_portada` → `_normalizar_gancho_portada` (4–6 palabras; autogenera fallback desde `titulo`/`gancho` si falta).
    - `subtitulos` → `_normalizar_subtitulos(..., duracion_clip)`: valida tipos, hace clamp a `[0.0, duracion_clip]`, ordena cronológicamente y elimina solapamientos.
    - **Re-numera `id` secuencialmente** (1..N tras descartes) y añade `duracion_segundos`.
 6. Lista vacía → `ValueError`.
@@ -468,12 +469,24 @@ Entrada **remota** (por cada URL en caché o `yt-dlp -g`, se antepone):
 | `scale=1080:1920:flags=bilinear` | Sube el fondo borroso a 1080×1920 | Upscale barato (el blur oculta artefactos) |
 | Frente `scale=1080:1920 decrease` | Encaja la fuente sin recorte (respetando aspecto) | Contenido íntegro, centrado |
 | `overlay=(W-w)/2:(H-h)/2` | Centra el frente vertical y horizontalmente | Layout clásico "blur bars" |
-| Watermark adaptativa (`obtener_dimensiones_video`) | `ffprobe` obtiene `(w, h)` efectivos (incl. SAR/rotación). Si la fuente ya es vertical 9:16 (`w/h ≤ 9/16 + 0.03`), fija `y = 60`; si hay barras desenfocadas, usa `y = max(40, (H - h_fg)/2 - h - 24)` | Evita que `watermark.png` invada cuadros 4:3, 1:1 o verticales |
-| Subtítulos dinámicos `.ass` (`generar_archivo_ass`) | Si `clip.subtitulos` tiene segmentos válidos, genera `jobs/<job_id>/subs_<id_clip>.ass` en estilo Shorts (`PlayRes 1080×1920`, `DejaVu Sans` tamaño `58` Bold `-1`, blanco `&H00FFFFFF`, `Outline=4`, sombra suave `Shadow=2`, `Alignment=2`, `MarginV=480`) y aplica `subtitles='<ruta_escapada>'` antes del formato final (y antes de `format=nv12,hwupload` en VAAPI) | Quemado limpio sin emojis sin glifo; si falla el filtro `subtitles`, reintenta automáticamente sin subtítulos sin abortar |
+| Watermark adaptativa (`_calcular_y_watermark`) | `ffprobe` obtiene `(w, h)` efectivos (incl. SAR/rotación). Si la fuente ya es vertical 9:16 (`w/h ≤ 9/16 + 0.03`), fija `y = 200`; si hay barras desenfocadas, usa `y = max(200, (H - h_fg)/2 - h - 24)` | Libra las cabeceras/menús superiores de Shorts (192 px) y TikTok (154 px) sin invadir cuadros 16:9/4:3/1:1 |
+| Subtítulos dinámicos `.ass` (`generar_archivo_ass`) | Si `clip.subtitulos` tiene segmentos válidos, genera `jobs/<job_id>/subs_<id_clip>.ass` sobre lienzo `PlayRes 1080×1920` (`DejaVu Sans`, tamaño `58`, Bold `-1`, blanco `&H00FFFFFF`, `Outline=4`, `Shadow=2`, `Alignment=2`, `MarginL=60`, `MarginR=238`, `MarginV=672`) y aplica `subtitles='<ruta_escapada>'` antes del formato final (y antes de `format=nv12,hwupload` en VAAPI) | Evita bloque inferior de Shorts y botonera lateral derecha de TikTok; filtro estricto anti-emojis (`_limpiar_texto_ass`) + fallback sin subtítulos si falla `libass` |
 | Salida `format=nv12,hwupload` / `format=yuv420p` | Superficie NV12 para `h264_vaapi` o YUV420P para `libx264` | Compatibilidad HW/SW y reproducción universal |
 
 - Codificación: `h264_vaapi -qp 23` (GPU) o `libx264 -preset veryfast -crf 22` (CPU), AAC 128 kbps, `+faststart`.
 - La imagen PNG es una entrada de 1 frame; `overlay` repite el último frame (`eof_action=repeat` por defecto).
+
+#### 4.3.3 Safe Zones Multiplataforma 9:16 (YouTube Shorts + TikTok)
+
+Sobre el lienzo vertical estándar **`1080 × 1920` (`PlayResX=1080`, `PlayResY=1920`)**, el backend aplica márgenes combinados (intersección segura de las interfaces de YouTube Shorts y TikTok):
+
+| Elemento | Parámetro / Coordenada | Dimensión Exacta | Objetivo de Safe Zone |
+|---|---|---|---|
+| **Marca de agua (`assets/watermark.png`)** | `y` en `overlay=(W-w)/2:<y_wm>` | `y = 200` px (fuente 9:16) / `max(200, (H-h_fg)/2 - h - 24)` (horizontal/mixta) | Supera la barra superior de estado y menús (192 px en YouTube Shorts y 154 px en TikTok). |
+| **Subtítulos `.ass` (Margen inferior)** | `MarginV` | `672` px desde el borde inferior (`Alignment=2`) | Esquiva el bloque inferior de título, canal, audio y barra de progreso en YouTube Shorts y TikTok. |
+| **Subtítulos `.ass` (Margen derecho)** | `MarginR` | `238` px desde el borde derecho | Evita colisión con la botonera vertical derecha (like, comentarios, guardar, compartir) en TikTok y Shorts. |
+| **Subtítulos `.ass` (Margen izquierdo)** | `MarginL` | `60` px desde el borde izquierdo | Mantiene respiración simétrica lateral sin invadir bordes del viewport móvil. |
+| **Tipografía & Filtro `.ass`** | `Fontname`, `Fontsize`, `_limpiar_texto_ass` | `DejaVu Sans`, `58`, Bold `-1`, `Alignment=2` | Legibilidad alta con contorno (`Outline=4`) y eliminación de emojis sin glifo en Linux/libass. |
 
 ### 4.4 Integración con YouTube Data API v3
 
@@ -524,7 +537,7 @@ youtube.videos().insert(
 | Pestaña | Componentes |
 |---|---|
 | **🚀 1. Extractor & Pipeline** | `estado_banner` (HTML) · `url_input` (Textbox) · `modelo_dropdown` (choices=`MODELOS_CANDIDATOS`, default `gemini-3.8-flash`) · `subir_yt_chk` (Checkbox, default **True**) · `solo_analisis_chk` (default False) · `api_key_input` (password, opcional) · `btn_ejecutar` (primary, lg) · `salida_logs` (Textbox 14–20 líneas, read-only) · `video_preview` (Video, h=420) · Accordion → `clips_json_view` (JSON) |
-| **🎬 2. Galería de Clips (9:16)** | `btn_refrescar_galeria` · `galeria_videos` (Gallery, 3 columnas, h=520, contain) · `reproductor_galeria` (Video, h=520) · `tarjetas_galeria_html` (HTML) |
+| **🎬 2. Galería de Clips (9:16)** | `btn_refrescar_galeria` · `galeria_videos` (Gallery, 3 columnas, h=520, contain) · `reproductor_galeria` (Video, h=520) · `tarjetas_galeria_html` (HTML escapado con `html.escape`, bloques diferenciados copiables para **YouTube Shorts** y **TikTok** vía `js_on_load`) |
 | **📈 3. Historial de Subidas** | `btn_refrescar_historial` · `resumen_historial_html` · `tabla_historial` (Dataframe: Fecha Subida, Archivo Local, Título SEO, ID YouTube, URL Directa Short, Privacidad, Tags Clave[≤6]) |
 
 **Eventos:**
@@ -558,30 +571,50 @@ youtube.videos().insert(
 
 ### 5.1 `clips.json` (sincronizado entre `jobs/<job_id>/clips.json` y la raíz del proyecto)
 
-Ciclo de vida: **v1** escrito por `analizar_con_gemini` (en `job_dir` y sincronizado en raíz) → **v2** reescrito tras render/subida (CLI y GUI). Cada ejecución mantiene su versión histórica inmutable dentro de `jobs/<job_id>/clips.json`, mientras que `BASE_DIR / "clips.json"` actúa como puntero al último estado generado.
+Ciclo de vida: generado por `analizar_con_gemini` (en `job_dir` y sincronizado en raíz) → actualizado tras render/subida (CLI y GUI). Cada ejecución mantiene su versión histórica inmutable dentro de `jobs/<job_id>/clips.json`, mientras que `BASE_DIR / "clips.json"` actúa como puntero al último estado generado.
 
-**Esquema (v2):**
+#### Esquema Multiplataforma v3 (Shorts + TikTok)
+
+El modelo Pydantic `ClipViral` en [pipeline_viral_clips.py](file:///home/bastiboy/clips_automation/pipeline_viral_clips.py) exige metadatos diferenciados para **YouTube Shorts** y **TikTok** manteniendo retrocompatibilidad con archivos `clips.json` v1/v2 y `subidas_shorts.json`:
+
+| Campo | Plataforma | Tipo | Regla / Normalización en `_limpiar_y_parsear_json` |
+|---|---|---|---|
+| `id` | Común | `int` | Secuencial `1..N` tras validación temporal |
+| `inicio` / `fin` | Común | `str` | Formato `HH:MM:SS`, `fin - inicio >= 5s`, `fin <= duracion_total` |
+| `gancho` | Común | `str` | Frase literal de apertura (primeros 2 segundos) |
+| `razon_viral` | Común | `str` | Gatillo psicológico/narrativo de retención |
+| `titulo` | YouTube Shorts | `str` | ≤ 60 caracteres (recorte a 57 + `"..."`) |
+| `descripcion` | YouTube Shorts | `str` | 2 líneas + CTA + `#Shorts` garantizado |
+| `etiquetas` | YouTube Shorts | `List[str]` | 8 a 12 tags SEO sin prefijo `#` (`_normalizar_etiquetas`) |
+| `caption_tiktok` | TikTok (v3) | `str` | ≤ 150 caracteres para SEO semántico y comentarios; fallback autogenerado desde `gancho`/`titulo` si falta |
+| `hashtags_tiktok` | TikTok (v3) | `List[str]` | Exactamente 3 a 5 hashtags con prefijo `#`; si falta en v1/v2 reutiliza tags relevantes de `etiquetas` + defaults TikTok |
+| `gancho_visual_portada` | TikTok (v3) | `str` | Titular visual de 4 a 6 palabras para portada/primeros 2s; fallback autogenerado desde `titulo`/`gancho` si falta |
+| `subtitulos` | Común | `List[SegmentoSubtitulo]` | Segmentos `{inicio_rel, fin_rel, texto}` (4–6 palabras, sin emojis, sin solapes) |
+
 ```jsonc
 [
   {
     "id": 1,                              // int, secuencial 1..N (re-numerado tras validación)
-    "titulo": "string ≤60",               // recortado a 57+"..." si excede
+    "titulo": "string ≤60",               // YouTube Shorts: recortado a 57+"..." si excede
     "inicio": "HH:MM:SS",                 // normalizado
     "fin": "HH:MM:SS",                    // ≤ duracion_total
     "gancho": "string",
     "razon_viral": "string",
     "descripcion": "string con \\n y #Shorts",
     "etiquetas": ["8..12 strings sin #"],
+    "caption_tiktok": "string ≤150",      // TikTok v3: SEO semántico + detonador de comentarios
+    "hashtags_tiktok": ["#tag1", "#tag2", "#tag3"], // TikTok v3: exactamente 3..5 hashtags con #
+    "gancho_visual_portada": "TITULAR DE 4 A 6 PALABRAS", // TikTok v3: portada / primeros 2s
     "subtitulos": [                       // opcional (default []), segmentos relativos al clip
       {
         "inicio_rel": 0.0,                // float segundos >= 0.0
         "fin_rel": 1.8,                   // float segundos <= duracion_clip
-        "texto": "¡NO PUEDE SER ESTO!"     // frase corta (4-6 palabras)
+        "texto": "¡NO PUEDE SER ESTO!"     // frase corta (4-6 palabras, sin emojis)
       }
     ],
     "duracion_segundos": 51,              // int (fin-inicio)
     "modelo_ia": "gemini-3.8-flash",      // modelo que respondió con éxito
-    // --- añadidos en fase render/subida (v2) ---
+    // --- añadidos en fase render/subida ---
     "archivo_local": "/home/bastiboy/clips_automation/clips_finales/<job_id>_clip_1.mp4",
     "youtube_id": "omzV0U7F9RQ",          // solo si se subió
     "youtube_url": "https://youtube.com/shorts/omzV0U7F9RQ",

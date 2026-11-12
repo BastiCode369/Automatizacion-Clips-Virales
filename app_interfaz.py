@@ -179,6 +179,93 @@ CUSTOM_CSS = """
     font-size: 0.76rem;
 }
 
+.tag-pill-tt {
+    display: inline-block;
+    background: rgba(0, 242, 234, 0.12);
+    color: #67e8f9;
+    border: 1px solid rgba(0, 242, 234, 0.35);
+    border-radius: 6px;
+    padding: 2px 8px;
+    margin: 2px 4px 2px 0;
+    font-size: 0.76rem;
+}
+
+.platform-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+    margin-top: 12px;
+}
+
+.platform-box {
+    background: #181824;
+    border: 1px solid #2d2d42;
+    border-radius: 10px;
+    padding: 12px;
+}
+
+.platform-box.yt-box {
+    border-top: 3px solid #ef4444;
+}
+
+.platform-box.tt-box {
+    border-top: 3px solid #00f2ea;
+}
+
+.platform-title {
+    margin: 0 0 10px 0;
+    font-size: 0.94rem;
+    font-weight: 700;
+    color: #f3f4f6;
+}
+
+.copy-field {
+    margin-bottom: 10px;
+}
+
+.copy-field:last-child {
+    margin-bottom: 0;
+}
+
+.copy-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+    font-size: 0.78rem;
+    color: #9ca3af;
+    font-weight: 600;
+}
+
+.copy-btn {
+    background: #252538;
+    color: #e5e7eb;
+    border: 1px solid #3b3b54;
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.copy-btn:hover {
+    background: #53fc18;
+    color: #09090b;
+    border-color: #53fc18;
+}
+
+.copy-value {
+    background: #101018;
+    border: 1px solid #262638;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 0.83rem;
+    color: #f3f4f6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    user-select: all;
+}
+
 button.primary {
     background: linear-gradient(90deg, #7c3aed 0%, #9333ea 100%) !important;
     border: 1px solid #a855f7 !important;
@@ -245,8 +332,21 @@ def _indexar_subidas_por_archivo() -> Dict[str, Dict[str, Any]]:
     return mapa
 
 
+def _campo_copiable_html(etiqueta: str, valor_escapado: str, extra_html: str = "") -> str:
+    """Renderiza un campo de metadatos listo para copiar al portapapeles con contenido ya escapado."""
+    etiqueta_esc = html.escape(etiqueta, quote=True)
+    return (
+        f'<div class="copy-field">'
+        f'<div class="copy-header"><span>{etiqueta_esc}</span>'
+        f'<button type="button" class="copy-btn">📋 Copiar</button></div>'
+        f'<div class="copy-value">{valor_escapado}</div>'
+        f"{extra_html}"
+        f"</div>"
+    )
+
+
 def construir_tarjetas_galeria_html(clips: List[Dict[str, Any]]) -> str:
-    """Construye el panel visual HTML escapado con metadatos, gancho, duración y enlace a YouTube de cada clip."""
+    """Construye el panel visual HTML escapado con bloques diferenciados para YouTube Shorts y TikTok."""
     mapa_subidas = _indexar_subidas_por_archivo()
     if not clips:
         archivos = sorted(CARPETA_SALIDA.glob("*.mp4"))
@@ -286,7 +386,8 @@ def construir_tarjetas_galeria_html(clips: List[Dict[str, Any]]) -> str:
     for clip in clips:
         cid = clip.get("id", "?")
         cid_esc = html.escape(str(cid), quote=True)
-        titulo_esc = html.escape(str(clip.get("titulo", f"Clip #{cid}")), quote=True)
+        titulo_raw = str(clip.get("titulo") or f"Clip #{cid}")
+        titulo_esc = html.escape(titulo_raw, quote=True)
         inicio = clip.get("inicio", "00:00:00")
         fin = clip.get("fin", "00:00:00")
         try:
@@ -298,10 +399,22 @@ def construir_tarjetas_galeria_html(clips: List[Dict[str, Any]]) -> str:
         fin_esc = html.escape(str(fin), quote=True)
         dur_esc = html.escape(str(dur_s), quote=True)
 
-        gancho_esc = html.escape(str(clip.get("gancho", "—")), quote=True)
-        razon_esc = html.escape(str(clip.get("razon_viral", "—")), quote=True)
-        descripcion_esc = html.escape(str(clip.get("descripcion", "—")), quote=True)
+        gancho_esc = html.escape(str(clip.get("gancho") or "—"), quote=True)
+        razon_esc = html.escape(str(clip.get("razon_viral") or "—"), quote=True)
+        descripcion_esc = html.escape(str(clip.get("descripcion") or "—"), quote=True)
         etiquetas = clip.get("etiquetas") or []
+        etiquetas_csv = ", ".join(str(t).strip() for t in etiquetas if str(t).strip())
+        etiquetas_csv_esc = html.escape(etiquetas_csv or "—", quote=True)
+
+        gancho_portada_esc = html.escape(str(clip.get("gancho_visual_portada") or "—"), quote=True)
+        caption_tt_esc = html.escape(str(clip.get("caption_tiktok") or "—"), quote=True)
+        hashtags_tt_raw = clip.get("hashtags_tiktok") or []
+        hashtags_tt_norm = [
+            (str(t).strip() if str(t).strip().startswith("#") else f"#{str(t).strip()}")
+            for t in hashtags_tt_raw
+            if str(t).strip()
+        ]
+        hashtags_tt_esc = html.escape(" ".join(hashtags_tt_norm) or "—", quote=True)
 
         ruta_local = clip.get("archivo_local")
         if ruta_local:
@@ -331,9 +444,39 @@ def construir_tarjetas_galeria_html(clips: List[Dict[str, Any]]) -> str:
             clase_badge = "k-badge-yt" if "error" in str(yt_status).lower() or "no renderizado" in str(yt_status).lower() else "k-badge-purple"
             yt_html = f'<span class="k-badge {clase_badge}">{yt_status_esc}</span>'
 
-        pills_html = "".join(
-            f'<span class="tag-pill">#{html.escape(str(t), quote=True)}</span>'
-            for t in etiquetas
+        pills_yt_html = (
+            '<div style="margin-top:6px;">'
+            + "".join(
+                f'<span class="tag-pill">#{html.escape(str(t).lstrip("#"), quote=True)}</span>'
+                for t in etiquetas
+                if str(t).strip()
+            )
+            + "</div>"
+        )
+        pills_tt_html = (
+            '<div style="margin-top:6px;">'
+            + "".join(
+                f'<span class="tag-pill-tt">{html.escape(t, quote=True)}</span>'
+                for t in hashtags_tt_norm
+            )
+            + "</div>"
+        )
+
+        bloque_youtube = (
+            f'<div class="platform-box yt-box">'
+            f'<div class="platform-title">🔴 YouTube Shorts</div>'
+            + _campo_copiable_html("Título", titulo_esc)
+            + _campo_copiable_html("Descripción", descripcion_esc)
+            + _campo_copiable_html("Etiquetas", etiquetas_csv_esc, pills_yt_html)
+            + "</div>"
+        )
+        bloque_tiktok = (
+            f'<div class="platform-box tt-box">'
+            f'<div class="platform-title">🎵 TikTok</div>'
+            + _campo_copiable_html("Gancho Visual de Portada", gancho_portada_esc)
+            + _campo_copiable_html("Caption TikTok", caption_tt_esc)
+            + _campo_copiable_html("Hashtags TikTok", hashtags_tt_esc, pills_tt_html)
+            + "</div>"
         )
 
         tarjetas.append(
@@ -346,8 +489,7 @@ def construir_tarjetas_galeria_html(clips: List[Dict[str, Any]]) -> str:
             f"</div>"
             f'<p style="margin:6px 0;">🎯 <strong>Hook (2s):</strong> <em>"{gancho_esc}"</em></p>'
             f'<p style="margin:6px 0;color:#d1d5db;">🧠 <strong>Gatillo Viral:</strong> {razon_esc}</p>'
-            f'<p style="margin:6px 0;color:#9ca3af;font-size:0.86rem;">📝 <strong>Descripción SEO:</strong> {descripcion_esc}</p>'
-            f'<div style="margin-top:8px;">{pills_html}</div>'
+            f'<div class="platform-grid">{bloque_youtube}{bloque_tiktok}</div>'
             f"</div>"
         )
     return "".join(tarjetas)
@@ -712,7 +854,36 @@ def construir_interfaz() -> gr.Blocks:
                             height=520,
                         )
 
-                tarjetas_galeria_html = gr.HTML(html_inicial)
+                tarjetas_galeria_html = gr.HTML(
+                    html_inicial,
+                    js_on_load="""
+                    element.addEventListener('click', function(e) {
+                        const btn = e.target.closest('.copy-btn');
+                        if (!btn) return;
+                        const field = btn.closest('.copy-field');
+                        const valEl = field ? field.querySelector('.copy-value') : null;
+                        if (!valEl) return;
+                        const texto = (valEl.textContent || '').trim();
+                        const marcarCopiado = () => {
+                            const prev = btn.textContent;
+                            btn.textContent = '✓ Copiado';
+                            setTimeout(() => { btn.textContent = prev; }, 1400);
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(texto).then(marcarCopiado).catch(() => {});
+                        } else {
+                            const ta = document.createElement('textarea');
+                            ta.value = texto;
+                            ta.style.position = 'fixed';
+                            ta.style.opacity = '0';
+                            document.body.appendChild(ta);
+                            ta.select();
+                            try { document.execCommand('copy'); marcarCopiado(); } catch (_) {}
+                            document.body.removeChild(ta);
+                        }
+                    });
+                    """,
+                )
 
             # PESTAÑA 3: HISTORIAL DE SUBIDAS A YOUTUBE
             with gr.Tab("📈 3. Historial de Subidas"):
