@@ -279,6 +279,189 @@ button.primary:hover {
     color: #09090b !important;
     border-color: #53fc18 !important;
 }
+
+@keyframes kicksazos-bar-shimmer {
+    0% { background-position: 0% 50%; }
+    100% { background-position: 200% 50%; }
+}
+
+@keyframes kicksazos-pulse-dot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.45; transform: scale(0.82); }
+}
+
+.telemetry-card {
+    background: linear-gradient(180deg, #151521 0%, #111119 100%);
+    border: 1px solid #2e2e42;
+    border-radius: 12px;
+    padding: 14px 18px;
+    margin: 8px 0 12px 0;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.35);
+}
+
+.telemetry-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.telemetry-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 700;
+    font-size: 0.94rem;
+    color: #f3f4f6;
+}
+
+.telemetry-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 999px;
+    background: #6b7280;
+    display: inline-block;
+}
+
+.telemetry-dot.active {
+    background: #53fc18;
+    box-shadow: 0 0 10px rgba(83, 252, 24, 0.75);
+    animation: kicksazos-pulse-dot 1.2s ease-in-out infinite;
+}
+
+.telemetry-dot.done {
+    background: #22c55e;
+}
+
+.telemetry-dot.err {
+    background: #ef4444;
+}
+
+.telemetry-phase-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.telemetry-pill {
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: #1b1b28;
+    color: #9ca3af;
+    border: 1px solid #2a2a3c;
+    letter-spacing: 0.02em;
+}
+
+.telemetry-pill.active {
+    background: rgba(139, 92, 246, 0.22);
+    color: #e9d5ff;
+    border-color: #a855f7;
+    box-shadow: 0 0 12px rgba(139, 92, 246, 0.28);
+}
+
+.telemetry-pill.done {
+    background: rgba(83, 252, 24, 0.14);
+    color: #53fc18;
+    border-color: rgba(83, 252, 24, 0.45);
+}
+
+.telemetry-bar-block {
+    margin-bottom: 10px;
+}
+
+.telemetry-bar-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.79rem;
+    color: #d1d5db;
+    margin-bottom: 4px;
+    font-variant-numeric: tabular-nums;
+}
+
+.telemetry-bar-track {
+    width: 100%;
+    height: 11px;
+    background: #1c1c29;
+    border: 1px solid #2c2c40;
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.telemetry-bar-track.thin {
+    height: 7px;
+}
+
+.telemetry-bar-fill {
+    height: 100%;
+    border-radius: 999px;
+    transition: width 0.28s ease-out;
+    background: linear-gradient(90deg, #7c3aed 0%, #a855f7 50%, #53fc18 100%);
+    background-size: 200% 100%;
+}
+
+.telemetry-bar-fill.active {
+    animation: kicksazos-bar-shimmer 1.8s linear infinite;
+}
+
+.telemetry-bar-fill.global {
+    background: linear-gradient(90deg, #06b6d4 0%, #8b5cf6 55%, #53fc18 100%);
+    background-size: 200% 100%;
+}
+
+.telemetry-bar-fill.done {
+    background: linear-gradient(90deg, #22c55e 0%, #53fc18 100%);
+    animation: none;
+}
+
+.telemetry-bar-fill.err {
+    background: linear-gradient(90deg, #dc2626 0%, #ef4444 100%);
+    animation: none;
+}
+
+.telemetry-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.telemetry-kpi-item {
+    background: #181824;
+    border: 1px solid #2b2b3f;
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+.telemetry-kpi-label {
+    font-size: 0.70rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #9ca3af;
+    margin-bottom: 2px;
+}
+
+.telemetry-kpi-value {
+    font-size: 0.88rem;
+    font-weight: 700;
+    color: #f3f4f6;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.telemetry-detail {
+    margin-top: 8px;
+    font-size: 0.78rem;
+    color: #9ca3af;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
 """
 
 
@@ -306,6 +489,166 @@ def _banner_html(titulo: str, detalle: str, nivel: str = "run") -> str:
         f"<strong>{icono} {titulo_seguro}</strong><br/>"
         f"<span>{detalle_seguro}</span>"
         f"</div>"
+    )
+
+
+def construir_panel_telemetria_html(estado: Optional[Dict[str, Any]] = None) -> str:
+    """Construye el panel HTML/CSS animado de telemetría en tiempo real (barras, FPS, MB/s, ETA y encoder)."""
+    if not estado:
+        return (
+            '<div class="telemetry-card">'
+            '<div class="telemetry-header">'
+            '<div class="telemetry-title-wrap"><span class="telemetry-dot"></span>'
+            '<span>Telemetría en Vivo — En espera</span></div>'
+            '<div class="telemetry-phase-pills">'
+            '<span class="telemetry-pill">1. Audio</span>'
+            '<span class="telemetry-pill">2. Gemini IA</span>'
+            '<span class="telemetry-pill">3. Render 9:16</span>'
+            '<span class="telemetry-pill">4. YouTube</span>'
+            '</div></div>'
+            '<div class="telemetry-bar-block">'
+            '<div class="telemetry-bar-label"><span>Etapa activa</span><span>0.0%</span></div>'
+            '<div class="telemetry-bar-track"><div class="telemetry-bar-fill" style="width:0%"></div></div>'
+            '</div>'
+            '<div class="telemetry-bar-block" style="margin-bottom:0;">'
+            '<div class="telemetry-bar-label"><span>Progreso global del job</span><span>0.0%</span></div>'
+            '<div class="telemetry-bar-track thin"><div class="telemetry-bar-fill global" style="width:0%"></div></div>'
+            '</div>'
+            '<div class="telemetry-kpi-grid">'
+            '<div class="telemetry-kpi-item"><div class="telemetry-kpi-label">Velocidad / Ritmo</div><div class="telemetry-kpi-value">--</div></div>'
+            '<div class="telemetry-kpi-item"><div class="telemetry-kpi-label">ETA Restante</div><div class="telemetry-kpi-value">--:--</div></div>'
+            '<div class="telemetry-kpi-item"><div class="telemetry-kpi-label">Motor / Encoder</div><div class="telemetry-kpi-value">Listo</div></div>'
+            '<div class="telemetry-kpi-item"><div class="telemetry-kpi-label">Bloque / Tamaño</div><div class="telemetry-kpi-value">--</div></div>'
+            '</div>'
+            '<div class="telemetry-detail">Inicia el pipeline para monitorear descarga MB/s, bloques Gemini y FPS/VAAPI en vivo.</div>'
+            '</div>'
+        )
+
+    fase = str(estado.get("fase") or "run").lower()
+    progreso_global = max(0.0, min(100.0, float(estado.get("progreso", 0.0)) * 100.0))
+    tele = estado.get("telemetria") or {}
+    etapa = str(tele.get("etapa") or fase).lower()
+
+    pct_etapa_raw = tele.get("porcentaje")
+    pct_etapa = (
+        max(0.0, min(100.0, float(pct_etapa_raw)))
+        if pct_etapa_raw is not None
+        else progreso_global
+    )
+
+    titulo_etapa = str(
+        tele.get("titulo_etapa") or estado.get("mensaje") or "Ejecutando Pipeline"
+    )
+    eta = str(tele.get("eta") or ("00:00" if fase == "completado" else "--:--"))
+    detalle = str(tele.get("detalle") or estado.get("mensaje") or "")
+
+    # Determina KPIs según etapa activa
+    if etapa in ("descarga", "descarga_video"):
+        vel_kpi = str(tele.get("velocidad_red") or "--")
+        motor_kpi = "yt-dlp 16 hilos" if etapa == "descarga" else "yt-dlp 1080p"
+        tam = str(tele.get("tamano_total") or "--")
+        bloque_kpi = f"Tamaño: {tam}"
+    elif etapa == "gemini":
+        modelo = str(tele.get("modelo_ia") or "Gemini")
+        b_act = tele.get("bloque_actual")
+        b_tot = tele.get("total_bloques")
+        vel_kpi = "Streaming JSON"
+        motor_kpi = modelo
+        bloque_kpi = f"Bloque {b_act}/{b_tot}" if b_act and b_tot else "Análisis único"
+    elif etapa == "render":
+        fps = str(tele.get("fps") or "--")
+        vel_x = str(tele.get("velocidad_x") or "--")
+        vel_kpi = f"{vel_x} • {fps} FPS"
+        motor_kpi = str(tele.get("encoder") or "ffmpeg")
+        c_idx = tele.get("clip_indice")
+        c_tot = tele.get("total_clips")
+        cid = tele.get("clip_id")
+        if c_idx and c_tot:
+            bloque_kpi = f"Clip #{cid or c_idx} ({c_idx}/{c_tot})"
+        elif cid:
+            bloque_kpi = f"Clip #{cid}"
+        else:
+            bloque_kpi = "Render 9:16"
+    elif etapa == "youtube":
+        vel_kpi = "API Data v3"
+        motor_kpi = "OAuth Upload"
+        c_idx = tele.get("clip_indice")
+        c_tot = tele.get("total_clips")
+        cid = tele.get("clip_id")
+        bloque_kpi = f"Short #{cid or c_idx} ({c_idx}/{c_tot})" if c_idx and c_tot else "Subida Privada"
+    elif fase == "completado":
+        vel_kpi = "100% Finalizado"
+        motor_kpi = "Pipeline OK"
+        bloque_kpi = f"{len(estado.get('clips') or [])} clips"
+    else:
+        vel_kpi = "Error"
+        motor_kpi = "Detenido"
+        bloque_kpi = "--"
+
+    # Estado visual de clases (activo, completado, error)
+    if fase == "error":
+        clase_dot = "err"
+        clase_fill = "err"
+        clase_global = "err"
+    elif fase == "completado":
+        clase_dot = "done"
+        clase_fill = "done"
+        clase_global = "done"
+    else:
+        clase_dot = "active"
+        clase_fill = "active"
+        clase_global = "global active"
+
+    # Pills de progreso de fases
+    orden_fases = [
+        ("audio", "1. Audio"),
+        ("gemini", "2. Gemini IA"),
+        ("render", "3. Render 9:16"),
+        ("youtube", "4. YouTube"),
+    ]
+    mapa_idx = {
+        "audio": 0,
+        "gemini": 1,
+        "fuente": 2,
+        "render": 2,
+        "youtube": 3,
+        "completado": 4,
+        "error": -1,
+    }
+    idx_actual = mapa_idx.get(fase, 0)
+    pills_html = []
+    for i_p, (_, label_p) in enumerate(orden_fases):
+        if fase == "completado" or (idx_actual > i_p):
+            cls_p = "telemetry-pill done"
+        elif idx_actual == i_p:
+            cls_p = "telemetry-pill active"
+        else:
+            cls_p = "telemetry-pill"
+        pills_html.append(f'<span class="{cls_p}">{html.escape(label_p)}</span>')
+
+    return (
+        f'<div class="telemetry-card">'
+        f'<div class="telemetry-header">'
+        f'<div class="telemetry-title-wrap"><span class="telemetry-dot {clase_dot}"></span>'
+        f'<span>{html.escape(titulo_etapa, quote=True)}</span></div>'
+        f'<div class="telemetry-phase-pills">{"".join(pills_html)}</div>'
+        f'</div>'
+        f'<div class="telemetry-bar-block">'
+        f'<div class="telemetry-bar-label"><span>Progreso de etapa actual</span><span>{pct_etapa:.1f}%</span></div>'
+        f'<div class="telemetry-bar-track"><div class="telemetry-bar-fill {clase_fill}" style="width:{pct_etapa:.1f}%"></div></div>'
+        f'</div>'
+        f'<div class="telemetry-bar-block" style="margin-bottom:0;">'
+        f'<div class="telemetry-bar-label"><span>Progreso global del job</span><span>{progreso_global:.1f}%</span></div>'
+        f'<div class="telemetry-bar-track thin"><div class="telemetry-bar-fill {clase_global}" style="width:{progreso_global:.1f}%"></div></div>'
+        f'</div>'
+        f'<div class="telemetry-kpi-grid">'
+        f'<div class="telemetry-kpi-item"><div class="telemetry-kpi-label">Velocidad / Ritmo</div><div class="telemetry-kpi-value">{html.escape(vel_kpi, quote=True)}</div></div>'
+        f'<div class="telemetry-kpi-item"><div class="telemetry-kpi-label">ETA Restante</div><div class="telemetry-kpi-value">{html.escape(eta, quote=True)}</div></div>'
+        f'<div class="telemetry-kpi-item"><div class="telemetry-kpi-label">Motor / Encoder</div><div class="telemetry-kpi-value">{html.escape(motor_kpi, quote=True)}</div></div>'
+        f'<div class="telemetry-kpi-item"><div class="telemetry-kpi-label">Bloque / Tamaño</div><div class="telemetry-kpi-value">{html.escape(bloque_kpi, quote=True)}</div></div>'
+        f'</div>'
+        f'<div class="telemetry-detail">{html.escape(detalle, quote=True)}</div>'
+        f'</div>'
     )
 
 
@@ -606,8 +949,8 @@ def ejecutar_pipeline_gradio(
     publish_at_inicio: str = "",
     intervalo_horas: int | float = 0,
     progress=gr.Progress(track_tqdm=False),
-) -> Generator[Tuple[str, str, Optional[str], Any, List[Tuple[str, str]], str, List[List[Any]], str], None, None]:
-    """Consume el orquestador único ejecutar_pipeline_completo() y actualiza Gradio en tiempo real."""
+) -> Generator[Tuple[str, str, str, Any, Any, Any, Any, Any, Any], None, None]:
+    """Consume el orquestador único ejecutar_pipeline_completo() y actualiza Gradio y telemetría en tiempo real."""
     logs: List[str] = []
 
     def registrar_log(msg: str) -> None:
@@ -641,6 +984,11 @@ def ejecutar_pipeline_gradio(
         "error": "Alerta de Ejecución en el Pipeline",
     }
 
+    primera_emision = True
+    prev_fase: Optional[str] = None
+    prev_ultimo_video: Optional[str] = vid_prev
+    prev_clips_len = len(clips_prev)
+
     for estado in ejecutar_pipeline_completo(
         url=url,
         modelo_preferido=modelo_preferido,
@@ -658,27 +1006,58 @@ def ejecutar_pipeline_gradio(
 
         _reportar_progreso(progreso, mensaje)
 
-        if fase in ("gemini", "youtube", "completado", "error") or ultimo_video:
-            gal_items, vid_gal, gal_html, _ = obtener_datos_galeria()
-            hist_filas, hist_html = obtener_tabla_historial()
-            if ultimo_video:
+        cambio_fase_hito = fase != prev_fase and fase in ("fuente", "youtube", "completado", "error")
+        cambio_video = bool(ultimo_video and ultimo_video != prev_ultimo_video)
+        cambio_clips = bool(estado.get("clips")) and len(clips_estado) != prev_clips_len
+        debe_refrescar = primera_emision or cambio_fase_hito or cambio_video or cambio_clips
+
+        if debe_refrescar:
+            if not primera_emision:
+                gal_items, vid_gal, gal_html, _ = obtener_datos_galeria()
+                hist_filas, hist_html = obtener_tabla_historial()
+                if ultimo_video:
+                    vid_prev = ultimo_video
+                elif vid_gal:
+                    vid_prev = vid_gal
+            elif ultimo_video:
                 vid_prev = ultimo_video
-            elif vid_gal:
-                vid_prev = vid_gal
+
+            vid_out = vid_prev
+            clips_out = clips_estado
+            gal_items_out = gal_items
+            gal_html_out = gal_html
+            hist_filas_out = hist_filas
+            hist_html_out = hist_html
+        else:
+            vid_out = gr.skip()
+            clips_out = gr.skip()
+            gal_items_out = gr.skip()
+            gal_html_out = gr.skip()
+            hist_filas_out = gr.skip()
+            hist_html_out = gr.skip()
 
         nivel = "err" if fase == "error" else ("ok" if fase == "completado" else "run")
         titulo_banner = titulos_fase.get(fase, "Pipeline en Ejecución")
         banner = _banner_html(titulo_banner, mensaje, nivel)
+        telemetria_html = construir_panel_telemetria_html(estado)
+
+        primera_emision = False
+        prev_fase = fase
+        if ultimo_video:
+            prev_ultimo_video = ultimo_video
+        if estado.get("clips"):
+            prev_clips_len = len(clips_estado)
 
         yield (
             banner,
-            "\n".join(logs),
-            vid_prev,
-            clips_estado,
-            gal_items,
-            gal_html,
-            hist_filas,
-            hist_html,
+            telemetria_html,
+            "\n".join(list(logs)),
+            vid_out,
+            clips_out,
+            gal_items_out,
+            gal_html_out,
+            hist_filas_out,
+            hist_html_out,
         )
 
 
@@ -751,6 +1130,7 @@ def construir_interfaz() -> gr.Blocks:
                         "ok",
                     )
                 )
+                telemetria_panel = gr.HTML(construir_panel_telemetria_html())
 
                 with gr.Row():
                     with gr.Column(scale=5):
@@ -924,6 +1304,7 @@ def construir_interfaz() -> gr.Blocks:
             ],
             outputs=[
                 estado_banner,
+                telemetria_panel,
                 salida_logs,
                 video_preview,
                 clips_json_view,
