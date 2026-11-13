@@ -6,3 +6,4 @@ google-auth>=2.62
 google-auth-oauthlib>=1.5
 python-dotenv>=1.2
 yt-dlp>=2026.10.26
+faster-whisper>=1.1.0

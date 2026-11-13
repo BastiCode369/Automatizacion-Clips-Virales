@@ -103,7 +103,7 @@ class TestFase1TipografiaEmbebeYASS(unittest.TestCase):
                 tmp_dir / "subs_smoke.ass",
             )
             ass_text = Path(ruta_ass).read_text(encoding="utf-8")
-            self.assertIn("WrapStyle: 2", ass_text)
+            self.assertIn("WrapStyle: 0", ass_text)
             self.assertIn("PRUEBA TIPOGRAFÍA VIRAL", ass_text)
 
             _, fonts_dir = pvc._obtener_fuente_y_dir_subtitulos()
@@ -562,7 +562,29 @@ class TestFase2Y3OrquestadorCLIYGradio(unittest.TestCase):
         self.assertIn("100.0%", salidas[2][1])
 
         demo = app_interfaz.construir_interfaz()
-        self.assertIsInstance(demo, gr.Blocks)
+        try:
+            self.assertIsInstance(demo, gr.Blocks)
+        finally:
+            demo.close()
+            for obj_demo in (demo, getattr(app_interfaz, "demo", None)):
+                if obj_demo is not None:
+                    try:
+                        obj_demo.close()
+                    except Exception:
+                        pass
+            import asyncio
+            import gc
+
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
+            for obj in list(gc.get_objects()):
+                try:
+                    if isinstance(obj, asyncio.AbstractEventLoop) and not obj.is_closed() and not obj.is_running():
+                        obj.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

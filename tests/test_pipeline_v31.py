@@ -93,7 +93,7 @@ class TestFase1ExtraccionAudio(unittest.TestCase):
             self.assertEqual(cmd[cmd.index("--downloader") + 1], "aria2c")
             self.assertEqual(cmd[cmd.index("--downloader-args") + 1], "aria2c:-x 16 -s 16 -k 1M")
             self.assertEqual(cmd[cmd.index("-f") + 1], pvc.FORMATOS_AUDIO_DIRECTO)
-            self.assertEqual(cmd[cmd.index("--postprocessor-args") + 1], "ffmpeg:-vn -ac 1 -ar 16000 -b:a 32k")
+            self.assertEqual(cmd[cmd.index("--postprocessor-args") + 1], "ffmpeg:-vn -ac 1 -ar 12000 -b:a 24k")
 
     def test_extraer_audio_sin_aria2c_en_kick_twitch_m3u8(self):
         for url in (
@@ -297,9 +297,9 @@ class TestFase2ResilienciaYChunking(unittest.TestCase):
             audio.write_bytes(b"MP3")
 
             with patch.object(pvc.subprocess, "run") as mock_run:
-                corto = pvc._segmentar_audio_en_chunks(str(audio), 3300.0)
+                corto = pvc._segmentar_audio_en_chunks(str(audio), 1800.0)
             mock_run.assert_not_called()
-            self.assertEqual(corto, [(str(audio), 0.0, 3300.0)])
+            self.assertEqual(corto, [(str(audio), 0.0, 1800.0)])
 
             comandos = []
 
@@ -309,12 +309,12 @@ class TestFase2ResilienciaYChunking(unittest.TestCase):
                 return SimpleNamespace(returncode=0)
 
             with patch.object(pvc.subprocess, "run", side_effect=fake_ffmpeg):
-                largos = pvc._segmentar_audio_en_chunks(str(audio), 6000.0)
+                largos = pvc._segmentar_audio_en_chunks(str(audio), 3300.0)
 
             self.assertEqual(len(largos), 3)
-            self.assertEqual(largos[0][1:], (0.0, 2700.0))
-            self.assertEqual(largos[1][1:], (2610.0, 2700.0))
-            self.assertEqual(largos[2][1:], (5220.0, 780.0))
+            self.assertEqual(largos[0][1:], (0.0, 1500.0))
+            self.assertEqual(largos[1][1:], (1440.0, 1500.0))
+            self.assertEqual(largos[2][1:], (2880.0, 420.0))
             self.assertTrue(largos[0][0].endswith("temp_audio_chunk_00.mp3"))
             self.assertTrue(largos[1][0].endswith("temp_audio_chunk_01.mp3"))
             self.assertTrue(largos[2][0].endswith("temp_audio_chunk_02.mp3"))
@@ -332,12 +332,12 @@ class TestFase2ResilienciaYChunking(unittest.TestCase):
                 Path(cmd[-1]).write_bytes(b"CHUNK")
                 return SimpleNamespace(returncode=0)
 
-            # Simula 3 chunks:
-            # - chunk 0 (offset 0): clip 1 [00:10:00 -> 00:10:40] (40s) + clip solapado corto [00:44:20 -> 00:45:00] (40s = 2660..2700)
-            # - chunk 1 (offset 2610): clip solapado completo [00:00:50 -> 00:01:45] -> abs [2660..2715] = [00:44:20 -> 00:45:15] (55s)
-            # - chunk 2 (offset 5220): [] (chunk silencioso/muerto)
-            respuestas_por_chunk = [
-                [
+            # Simula 3 chunks (threshold > 1800s, bloques de 1500s, solapamiento 60s):
+            # - chunk 0 (offset 0): clip 1 [00:10:00 -> 00:10:40] (40s) + clip solapado corto [00:24:20 -> 00:25:00] (40s = 1460..1500)
+            # - chunk 1 (offset 1440): clip solapado completo [00:00:20 -> 00:01:15] -> abs [1460..1515] = [00:24:20 -> 00:25:15] (55s)
+            # - chunk 2 (offset 2880): [] (chunk silencioso/muerto)
+            respuestas_por_nombre = {
+                "temp_audio_chunk_00.mp3": [
                     _hacer_clip_raw(
                         1,
                         "00:10:00",
@@ -347,17 +347,17 @@ class TestFase2ResilienciaYChunking(unittest.TestCase):
                     ),
                     _hacer_clip_raw(
                         2,
-                        "00:44:20",
-                        "00:45:00",
+                        "00:24:20",
+                        "00:25:00",
                         titulo="Clip Cortado Borde",
                         subtitulos=[{"inicio_rel": 0.0, "fin_rel": 1.0, "texto": "Borde corto"}],
                     ),
                 ],
-                [
+                "temp_audio_chunk_01.mp3": [
                     _hacer_clip_raw(
                         1,
-                        "00:00:50",
-                        "00:01:45",
+                        "00:00:20",
+                        "00:01:15",
                         titulo="Clip Completo Solapado",
                         subtitulos=[
                             {"inicio_rel": 0.0, "fin_rel": 1.5, "texto": "Inicio completo"},
@@ -365,16 +365,14 @@ class TestFase2ResilienciaYChunking(unittest.TestCase):
                         ],
                     )
                 ],
-                [],
-            ]
-            llamadas_chunk = {"idx": 0}
+                "temp_audio_chunk_02.mp3": [],
+            }
 
-            def fake_analizar_chunk(client, ruta_archivo, duracion_bloque, modelo_preferido, on_log):
-                idx = llamadas_chunk["idx"]
-                llamadas_chunk["idx"] += 1
+            def fake_analizar_chunk(client, ruta_archivo, duracion_bloque, modelo_preferido, on_log=None, *args, **kwargs):
+                ruta = Path(ruta_archivo)
                 # Asegura que el chunk temporal exista durante el análisis
-                self.assertTrue(Path(ruta_archivo).exists())
-                return respuestas_por_chunk[idx]
+                self.assertTrue(ruta.exists())
+                return respuestas_por_nombre[ruta.name]
 
             guardado = {}
 
@@ -390,19 +388,19 @@ class TestFase2ResilienciaYChunking(unittest.TestCase):
                 pvc, "_guardar_y_sincronizar_clips", side_effect=fake_guardar
             ):
                 resultado = pvc.analizar_con_gemini(
-                    audio, duracion_total=6000.0, job_dir=tmp_dir, on_log=lambda _: None
+                    audio, duracion_total=3300.0, job_dir=tmp_dir, on_log=lambda _: None
                 )
 
             self.assertEqual(len(resultado), 2)
             self.assertEqual([c["id"] for c in resultado], [1, 2])
             self.assertEqual(resultado[0]["inicio"], "00:10:00")
             self.assertEqual(resultado[0]["fin"], "00:10:40")
-            # Clip 2 ganó la deduplicación (55s vs 40s) y desplazó su timestamp +2610s
+            # Clip 2 ganó la deduplicación (55s vs 40s) y desplazó su timestamp +1440s
             self.assertEqual(resultado[1]["titulo"], "Clip Completo Solapado")
-            self.assertEqual(resultado[1]["inicio"], "00:44:20")
-            self.assertEqual(resultado[1]["fin"], "00:45:15")
+            self.assertEqual(resultado[1]["inicio"], "00:24:20")
+            self.assertEqual(resultado[1]["fin"], "00:25:15")
             self.assertEqual(resultado[1]["duracion_segundos"], 55)
-            # Los subtítulos siguen siendo relativos al clip (no se les sumó 2610s)
+            # Los subtítulos siguen siendo relativos al clip (no se les sumó 1440s)
             self.assertEqual(resultado[1]["subtitulos"][0]["inicio_rel"], 0.0)
             self.assertEqual(resultado[1]["subtitulos"][0]["fin_rel"], 1.5)
             # Todos los chunks temporales fueron borrados y el audio original permanece intacto
@@ -534,9 +532,9 @@ class TestFase4SubtitulosYEstilosASS(unittest.TestCase):
                 salida = pvc.generar_archivo_ass(subs, ruta_ass)
 
             contenido = Path(salida).read_text(encoding="utf-8")
-            self.assertIn("WrapStyle: 2", contenido)
+            self.assertIn("WrapStyle: 0", contenido)
             self.assertIn(
-                "Style: Default,Montserrat ExtraBold,54,&H00FFFFFF,&H0000FFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,1.5,0,1,5.5,3.5,2,65,210,550,1",
+                "Style: Default,Montserrat ExtraBold,50,&H00FFFFFF,&H0000FFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,1.2,0,1,5.0,3.0,2,80,170,550,1",
                 contenido,
             )
             popin = r"{\fad(40,40)\t(0,70,\fscx105\fscy105)\t(70,140,\fscx100\fscy100)}"

@@ -8,7 +8,10 @@ from dotenv import load_dotenv
 load_dotenv(BASE_DIR / ".env")
 
 import argparse
+import array
+import concurrent.futures
 from datetime import datetime, timedelta, timezone
+import gc
 import glob
 import inspect
 import json
@@ -18,17 +21,25 @@ import queue
 import random
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, Generator, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, List, NamedTuple, Optional, Set, Tuple
 from urllib.parse import urlparse
+import urllib.error
+import urllib.request
 
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError, ServerError
 from pydantic import BaseModel, Field, TypeAdapter
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None  # type: ignore[assignment,misc]
 
 from subir_shorts import (
     HISTORIAL_SUBIDAS_FILE,
@@ -46,6 +57,9 @@ MODELOS_CANDIDATOS = [
     "gemini-3.7-flash",
     "gemini-3.5-flash-lite",
 ]
+MODELOS_LOCALES_OLLAMA = ["qwen3:14b", "gemma3:12b", "qwen2.5:14b"]
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+WHISPER_MODEL_SIZE = "medium"
 RUTA_MARCA_AGUA = BASE_DIR / "assets" / "watermark.png"
 CARPETA_FUENTES = BASE_DIR / "assets" / "fonts"
 CARPETA_SALIDA = BASE_DIR / "clips_finales"
@@ -60,22 +74,28 @@ FORMATOS_VIDEO_RAPIDOS = (
 )
 
 
+class GeminiQuotaExhaustedError(RuntimeError):
+    """Se lanza cuando toda la cascada Gemini falla por agotamiento de cuota / error 429."""
+
+
 class JobContext(NamedTuple):
     job_id: str
     job_dir: Path
 
 
 class StreamUrlCache:
-    """Caché en memoria por job_id para URLs directas de stream (video_url, audio_url) y dimensiones."""
+    """Caché thread-safe en memoria por job_id para URLs directas de stream (video_url, audio_url) y dimensiones."""
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self._entries: Dict[str, Dict[str, Any]] = {}
 
     def obtener(self, job_id: str, url: str) -> Optional[Dict[str, Any]]:
-        entrada = self._entries.get(job_id)
-        if not entrada or entrada.get("source_url") != url:
-            return None
-        return entrada
+        with self._lock:
+            entrada = self._entries.get(job_id)
+            if not entrada or entrada.get("source_url") != url:
+                return None
+            return dict(entrada)
 
     def guardar(
         self,
@@ -92,21 +112,24 @@ class StreamUrlCache:
             "audio_url": audio_url,
             "dimensiones": dimensiones,
         }
-        self._entries[job_id] = registro
-        return registro
+        with self._lock:
+            self._entries[job_id] = registro
+            return dict(registro)
 
     def actualizar_dimensiones(
         self, job_id: str, url: str, dimensiones: Optional[Tuple[int, int]]
     ) -> None:
-        entrada = self.obtener(job_id, url)
-        if entrada is not None:
-            entrada["dimensiones"] = dimensiones
+        with self._lock:
+            entrada = self._entries.get(job_id)
+            if entrada is not None and entrada.get("source_url") == url:
+                entrada["dimensiones"] = dimensiones
 
     def invalidar(self, job_id: Optional[str] = None) -> None:
-        if job_id is None:
-            self._entries.clear()
-        else:
-            self._entries.pop(job_id, None)
+        with self._lock:
+            if job_id is None:
+                self._entries.clear()
+            else:
+                self._entries.pop(job_id, None)
 
 
 STREAM_URL_CACHE = StreamUrlCache()
@@ -172,6 +195,44 @@ class ClipViral(BaseModel):
         default_factory=list,
         description="Transcripción literal en bloques cortos (2 a 4 palabras, máximo 22 caracteres, sin emojis) sincronizados en segundos relativos desde 0.0 hasta la duración del clip.",
     )
+
+
+class ClipViralLocal(BaseModel):
+    """Esquema estructurado de clip viral para curaduría local con Ollama (subtítulos provienen de Whisper)."""
+
+    id: int = Field(description="Identificador entero secuencial del clip (1, 2, 3...)")
+    titulo: str = Field(
+        description="Título magnético de alta tasa de clics (CTR), máximo 60 caracteres, en español coloquial/streamer."
+    )
+    inicio: str = Field(description="Timestamp exacto de inicio en formato HH:MM:SS")
+    fin: str = Field(description="Timestamp exacto de fin en formato HH:MM:SS")
+    gancho: str = Field(
+        description="Primeras palabras textuales exactas del hook en los primeros 2 segundos"
+    )
+    razon_viral: str = Field(
+        description="Explicación estratégica del gatillo de retención, polémica, tensión o clímax narrativo"
+    )
+    descripcion: str = Field(
+        description="Resumen corto (2 líneas) con llamado a la acción (CTA) de suscripción y 3-5 hashtags estratégicos (#Shorts #Kicksazos)"
+    )
+    etiquetas: List[str] = Field(
+        description="Lista de 8 a 12 tags SEO clave incluyendo nombres propios de involucrados y ecosistema streaming colombiano"
+    )
+    caption_tiktok: str = Field(
+        description="Caption para TikTok de máximo 150 caracteres optimizado para SEO semántico y debate en comentarios."
+    )
+    hashtags_tiktok: List[str] = Field(
+        description="Lista de 3 a 5 hashtags estratégicos para TikTok mezclando nicho y alcance."
+    )
+    gancho_visual_portada: str = Field(
+        description="Titular visual de portada de 4 a 6 palabras, impactante, para retención inicial en TikTok."
+    )
+
+
+class ListaClipsLocal(BaseModel):
+    """Contenedor raíz de respuesta JSON estructurada para Ollama."""
+
+    clips: List[ClipViralLocal] = Field(default_factory=list)
 
 
 def obtener_duracion_media(ruta_archivo: str | Path) -> Optional[float]:
@@ -626,7 +687,7 @@ def generar_archivo_ass(
     subtitulos: List[Any],
     ruta_ass: str | Path,
 ) -> str:
-    """Genera un archivo .ass v3.2 estilizado en tercio medio-inferior (1080x1920) y devuelve su ruta absoluta."""
+    """Genera un archivo .ass v4.1 ópticamente centrado en Safe Zone 9:16 (WrapStyle: 0, Fontsize=50, MarginL=80, MarginR=170, MarginV=550)."""
     ruta = Path(ruta_ass).resolve()
     ruta.parent.mkdir(parents=True, exist_ok=True)
     fuente_sub, _ = _obtener_fuente_y_dir_subtitulos()
@@ -636,7 +697,7 @@ def generar_archivo_ass(
             "[Script Info]",
             "Title: Kicksazos Shorts Subtitles",
             "ScriptType: v4.00+",
-            "WrapStyle: 2",
+            "WrapStyle: 0",
             "ScaledBorderAndShadow: yes",
             "YCbCr Matrix: TV.709",
             "PlayResX: 1080",
@@ -644,7 +705,7 @@ def generar_archivo_ass(
             "",
             "[V4+ Styles]",
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            f"Style: Default,{fuente_sub},54,&H00FFFFFF,&H0000FFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,1.5,0,1,5.5,3.5,2,65,210,550,1",
+            f"Style: Default,{fuente_sub},50,&H00FFFFFF,&H0000FFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,1.2,0,1,5.0,3.0,2,80,170,550,1",
             "",
             "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -683,36 +744,65 @@ def generar_archivo_ass(
     return str(ruta)
 
 
-def _limpiar_y_parsear_json(
-    texto: str, duracion_total: Optional[float] = None, permitir_vacio: bool = False
-) -> List[dict]:
-    """Limpia posibles bloques markdown y valida la respuesta mediante regex y esquema tipado estricto."""
-    limpio = texto.strip()
+def _extraer_lista_json_con_esquema(
+    texto: str,
+    adapter: TypeAdapter[Any],
+    clave_dict: str,
+) -> list:
+    """Limpia bloques think/markdown y parsea una lista JSON validando con TypeAdapter o fallback regex."""
+    limpio = re.sub(r"<think>.*?</think>", "", str(texto or ""), flags=re.IGNORECASE | re.DOTALL).strip()
     limpio = re.sub(r"^```(?:json)?\s*", "", limpio, flags=re.IGNORECASE)
     limpio = re.sub(r"\s*```$", "", limpio)
     limpio = limpio.strip()
 
-    adapter = TypeAdapter(List[ClipViral])
     datos = None
     try:
-        clips_objetos = adapter.validate_json(limpio)
-        datos = [c.model_dump() for c in clips_objetos]
+        objetos = adapter.validate_json(limpio)
+        datos = [c.model_dump() for c in objetos]
     except Exception:
-        coincidencia = re.search(r"\[.*\]", limpio, flags=re.DOTALL)
-        if coincidencia:
-            bloque_json = coincidencia.group(0)
-            try:
-                clips_objetos = adapter.validate_json(bloque_json)
-                datos = [c.model_dump() for c in clips_objetos]
-            except Exception:
-                datos = json.loads(bloque_json)
-        else:
+        try:
             datos = json.loads(limpio)
+        except Exception:
+            coincidencia = re.search(r"\[.*\]", limpio, flags=re.DOTALL)
+            if coincidencia:
+                bloque_json = coincidencia.group(0)
+                try:
+                    objetos = adapter.validate_json(bloque_json)
+                    datos = [c.model_dump() for c in objetos]
+                except Exception:
+                    datos = json.loads(bloque_json)
+            else:
+                datos = json.loads(limpio)
 
     if isinstance(datos, dict):
-        datos = datos.get("clips", [])
+        datos = datos.get(clave_dict, [])
     if not isinstance(datos, list):
-        raise ValueError("La respuesta JSON de Gemini no contiene una lista válida de clips.")
+        raise ValueError(f"La respuesta JSON de IA no contiene una lista válida de '{clave_dict}'.")
+    return datos
+
+
+def _parsear_subtitulos_json(texto: str, duracion_clip: float) -> List[SegmentoSubtitulo]:
+    """Parsea y normaliza la respuesta JSON de alineación fonética (list[SegmentoSubtitulo])."""
+    datos = _extraer_lista_json_con_esquema(
+        texto,
+        TypeAdapter(List[SegmentoSubtitulo]),
+        clave_dict="subtitulos",
+    )
+    subs = _normalizar_subtitulos(datos, duracion_clip)
+    if not subs:
+        raise ValueError("La respuesta JSON de alineación fonética no contiene subtítulos válidos.")
+    return subs
+
+
+def _limpiar_y_parsear_json(
+    texto: str, duracion_total: Optional[float] = None, permitir_vacio: bool = False
+) -> List[dict]:
+    """Limpia posibles bloques markdown y valida la respuesta mediante regex y esquema tipado estricto."""
+    datos = _extraer_lista_json_con_esquema(
+        texto,
+        TypeAdapter(List[ClipViral]),
+        clave_dict="clips",
+    )
     if not datos:
         if permitir_vacio:
             return []
@@ -996,7 +1086,7 @@ def extraer_audio(
     on_telemetria: Optional[Callable[[Dict[str, Any]], None]] = None,
     on_log: Optional[Callable[[str], None]] = None,
 ) -> str:
-    """Extrae audio mono 16kHz/32k mediante descarga paralela yt-dlp (--newline) y fallback FFmpeg streaming."""
+    """Extrae audio mono 12kHz/24k mediante descarga paralela yt-dlp (--newline) y fallback FFmpeg streaming."""
     def _log(msg: str) -> None:
         if on_log is not None:
             on_log(msg)
@@ -1007,13 +1097,75 @@ def extraer_audio(
     directorio = Path(job_dir).resolve() if job_dir else BASE_DIR
     directorio.mkdir(parents=True, exist_ok=True)
 
+    ruta_local_entrada = Path(url)
+    try:
+        es_archivo_local = bool(str(url or "").strip()) and ruta_local_entrada.is_file()
+    except OSError:
+        es_archivo_local = False
+
     audio_salida = directorio / "temp_audio.mp3"
     for patron in (str(directorio / "temp_audio.*"), str(directorio / "temp_audio_chunk_*.mp3")):
         for viejo in glob.glob(patron):
             try:
+                if es_archivo_local and Path(viejo).resolve() == ruta_local_entrada.resolve():
+                    continue
                 os.remove(viejo)
             except OSError:
                 pass
+
+    if es_archivo_local:
+        ruta_local_res = ruta_local_entrada.resolve()
+        _log(f"Extrayendo audio local desde archivo fuente: {ruta_local_entrada.name}")
+        _emitir_telemetria(
+            on_telemetria,
+            [0.0],
+            {
+                "etapa": "descarga",
+                "titulo_etapa": "Extrayendo Audio Local",
+                "porcentaje": 0.0,
+                "velocidad_red": "Local",
+                "tamano_total": "--",
+                "eta": "00:00",
+                "detalle": ruta_local_entrada.name,
+            },
+            forzar=True,
+        )
+        if ruta_local_res != audio_salida.resolve():
+            comando_local = [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(ruta_local_res),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "12000",
+                "-b:a",
+                "24k",
+                str(audio_salida),
+            ]
+            _ejecutar_comando_con_captura(comando_local)
+        if audio_salida.exists() and audio_salida.stat().st_size > 0:
+            _emitir_telemetria(
+                on_telemetria,
+                [0.0],
+                {
+                    "etapa": "descarga",
+                    "titulo_etapa": "Audio Extraído con Éxito",
+                    "porcentaje": 100.0,
+                    "velocidad_red": "Completado",
+                    "tamano_total": f"{audio_salida.stat().st_size / (1024 * 1024):.2f}MiB",
+                    "eta": "00:00",
+                    "detalle": "Pista de audio local lista para IA",
+                },
+                forzar=True,
+            )
+            return str(audio_salida.resolve())
+        raise RuntimeError(f"No se pudo extraer audio desde archivo local: {ruta_local_entrada}")
 
     # Intento primario: descarga paralela agresiva con yt-dlp (--concurrent-fragments 16 y aria2c opcional)
     salida_template = str(directorio / "temp_audio.%(ext)s")
@@ -1061,7 +1213,7 @@ def extraer_audio(
             "--audio-format",
             "mp3",
             "--postprocessor-args",
-            "ffmpeg:-vn -ac 1 -ar 16000 -b:a 32k",
+            "ffmpeg:-vn -ac 1 -ar 12000 -b:a 24k",
             "-o",
             salida_template,
             url,
@@ -1156,9 +1308,9 @@ def extraer_audio(
             "-ac",
             "1",
             "-ar",
-            "16000",
+            "12000",
             "-b:a",
-            "32k",
+            "24k",
             str(audio_salida),
         ]
     )
@@ -1274,12 +1426,12 @@ def _es_error_cuota_diaria_free_tier(error: APIError) -> bool:
 def _segmentar_audio_en_chunks(
     ruta_audio: str | Path,
     duracion_total: float,
-    max_duracion_chunk: int = 2700,
-    solapamiento: int = 90,
+    max_duracion_chunk: int = 1500,
+    solapamiento: int = 60,
 ) -> List[Tuple[str, float, float]]:
-    """Divide audios mayores a 55 min (>3300s) en bloques de 45 min con 90s de solapamiento usando ffmpeg -c copy."""
+    """Divide audios mayores a 30 min (>1800s) en bloques de 25 min con 60s de solapamiento usando ffmpeg -c copy."""
     ruta_src = Path(ruta_audio)
-    if duracion_total <= 3300:
+    if duracion_total <= 1800:
         return [(str(ruta_src), 0.0, float(duracion_total))]
 
     carpeta = ruta_src.resolve().parent
@@ -1335,6 +1487,214 @@ def _acepta_kwarg(fn: Callable[..., Any], nombre: str) -> bool:
     return False
 
 
+def _subir_archivo_gemini_activo(
+    client: genai.Client,
+    ruta_archivo: str | Path,
+    on_log: Optional[Callable[[str], None]] = None,
+    on_estado: Optional[Callable[[float, str], None]] = None,
+) -> Any:
+    """Sube un archivo a Gemini File API con reintentos y espera hasta estado ACTIVE."""
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+
+    archivo_subido = None
+    for intento_up in range(1, 5):
+        try:
+            archivo_subido = client.files.upload(file=str(ruta_archivo))
+            break
+        except Exception as e:
+            if intento_up == 4:
+                raise
+            _esperar_con_jitter(
+                intento_up,
+                base=3.0,
+                max_espera=30.0,
+                on_log=on_log,
+                contexto=(
+                    f"[AVISO] Error de red subiendo audio a File API ({type(e).__name__}, "
+                    f"intento {intento_up}/4) antes de reintentar: {e}"
+                ),
+            )
+
+    try:
+        estado = _obtener_estado_archivo(archivo_subido)
+        _log(f"Subido con ID {archivo_subido.name}. Estado inicial: {estado}. Esperando procesamiento...")
+        if on_estado is not None:
+            on_estado(0.18, f"Procesando audio en File API ({estado})...")
+        intentos_estado = 0
+        while estado != "ACTIVE":
+            if estado == "FAILED":
+                raise RuntimeError(f"Fallo al procesar archivo en Gemini: {estado}")
+            intentos_estado += 1
+            if intentos_estado > 150:
+                raise TimeoutError("Tiempo de espera agotado esperando estado ACTIVE en File API.")
+            time.sleep(4)
+            try:
+                archivo_subido = client.files.get(name=archivo_subido.name)
+                estado = _obtener_estado_archivo(archivo_subido)
+                _log(f"Estado actual del archivo: {estado}")
+                if on_estado is not None:
+                    on_estado(
+                        min(0.30, 0.18 + intentos_estado * 0.01),
+                        f"Esperando File API ({estado})...",
+                    )
+            except Exception as e_get:
+                _log(f"[AVISO] Error transitorio consultando estado del archivo: {e_get}")
+        _log("✓ Archivo de audio listo y activo para inferencia.")
+        return archivo_subido
+    except BaseException:
+        if archivo_subido is not None and getattr(archivo_subido, "name", None):
+            try:
+                client.files.delete(name=archivo_subido.name)
+            except Exception:
+                pass
+        raise
+
+
+def _ejecutar_cascada_modelos_gemini(
+    client: genai.Client,
+    archivo_subido: Any,
+    prompt: str,
+    response_schema: Any,
+    temperature: float,
+    parsear_fn: Callable[[str], Any],
+    modelo_preferido: Optional[str] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+    on_modelo_inicio: Optional[Callable[[str], None]] = None,
+    on_chunk_texto: Optional[Callable[[str, int], None]] = None,
+) -> Tuple[Any, str]:
+    """Ejecuta inferencia streaming sobre la cascada MODELOS_CANDIDATOS con salto 0s ante cuota diaria 429."""
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+
+    orden_modelos = list(MODELOS_CANDIDATOS)
+    if modelo_preferido and modelo_preferido.strip():
+        pref = modelo_preferido.strip()
+        orden_modelos = [pref] + [m for m in orden_modelos if m != pref]
+
+    resultado = None
+    modelo_usado: Optional[str] = None
+    max_intentos = 4
+    vio_error_429 = False
+
+    for modelo in orden_modelos:
+        _log(f"Probando análisis en streaming con: {modelo}...")
+        if on_modelo_inicio is not None:
+            on_modelo_inicio(modelo)
+        for intento in range(1, max_intentos + 1):
+            accion_siguiente = (
+                "reintentar" if intento < max_intentos else "saltar al siguiente modelo"
+            )
+            try:
+                partes_texto: List[str] = []
+                chars_recibidos = 0
+                stream = client.models.generate_content_stream(
+                    model=modelo,
+                    contents=[archivo_subido, prompt],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=response_schema,
+                        temperature=temperature,
+                    ),
+                )
+                for chunk in stream:
+                    txt_chunk = getattr(chunk, "text", None)
+                    if txt_chunk:
+                        partes_texto.append(txt_chunk)
+                        chars_recibidos += len(txt_chunk)
+                        if on_chunk_texto is not None:
+                            on_chunk_texto(modelo, chars_recibidos)
+
+                texto_respuesta = "".join(partes_texto).strip()
+                if not texto_respuesta:
+                    raise ValueError("Respuesta vacía recibida desde el stream de Gemini.")
+
+                resultado = parsear_fn(texto_respuesta)
+                modelo_usado = modelo
+                break
+            except ServerError as e:
+                codigo_err = getattr(e, "code", None) or 503
+                _esperar_con_jitter(
+                    intento,
+                    base=4.0,
+                    max_espera=25.0,
+                    on_log=on_log,
+                    contexto=(
+                        f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
+                        f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {e}"
+                    ),
+                )
+            except APIError as e:
+                codigo_err = getattr(e, "code", None) or "APIError"
+                detalle_err = getattr(e, "message", None) or str(e)
+                if (
+                    codigo_err == 429
+                    or _es_error_cuota_diaria_free_tier(e)
+                    or "RESOURCE_EXHAUSTED" in str(detalle_err).upper()
+                ):
+                    vio_error_429 = True
+                if _es_error_cuota_diaria_free_tier(e):
+                    _log(
+                        f"[AVISO] Cuota diaria gratuita agotada para {modelo} (código 429, "
+                        f"espera 0.00s): saltando inmediatamente al siguiente modelo. Detalle: {detalle_err}"
+                    )
+                    break
+                if codigo_err in (400, 404):
+                    _log(
+                        f"[AVISO] Modelo {modelo} falló (código {codigo_err}, espera 0.00s "
+                        f"antes de saltar al siguiente modelo): {detalle_err}"
+                    )
+                    break
+                if codigo_err in (429, 503):
+                    _esperar_con_jitter(
+                        intento,
+                        base=4.0,
+                        max_espera=25.0,
+                        on_log=on_log,
+                        contexto=(
+                            f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
+                            f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {detalle_err}"
+                        ),
+                    )
+                else:
+                    _log(
+                        f"[AVISO] Modelo {modelo} falló (código {codigo_err}, espera 0.00s "
+                        f"antes de saltar al siguiente modelo): {detalle_err}"
+                    )
+                    break
+            except Exception as e:
+                codigo_err = type(e).__name__
+                msg_err = str(e)
+                if "429" in msg_err or "RESOURCE_EXHAUSTED" in msg_err.upper():
+                    vio_error_429 = True
+                _esperar_con_jitter(
+                    intento,
+                    base=4.0,
+                    max_espera=25.0,
+                    on_log=on_log,
+                    contexto=(
+                        f"[AVISO] Modelo {modelo} falló (error {codigo_err}, "
+                        f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {e}"
+                    ),
+                )
+        if resultado is not None:
+            break
+
+    if resultado is None or modelo_usado is None:
+        if vio_error_429:
+            raise GeminiQuotaExhaustedError(
+                "Cuota diaria / límites 429 de Gemini agotados en todos los modelos candidatos."
+            )
+        raise RuntimeError("No se pudo obtener una respuesta JSON válida de los modelos disponibles.")
+    return resultado, modelo_usado
+
+
 def _analizar_archivo_audio_gemini(
     client: genai.Client,
     ruta_archivo: str | Path,
@@ -1379,166 +1739,39 @@ def _analizar_archivo_audio_gemini(
     modelo_inicial = (modelo_preferido or MODELOS_CANDIDATOS[0]).strip()
     _emitir_gem(0.05, modelo_inicial, "Subiendo audio a Gemini File API...", forzar=True)
 
-    archivo_subido = None
-    for intento_up in range(1, 5):
-        try:
-            archivo_subido = client.files.upload(file=str(ruta_archivo))
-            break
-        except Exception as e:
-            if intento_up == 4:
-                raise
-            _esperar_con_jitter(
-                intento_up,
-                base=3.0,
-                max_espera=30.0,
-                on_log=on_log,
-                contexto=(
-                    f"[AVISO] Error de red subiendo audio a File API ({type(e).__name__}, "
-                    f"intento {intento_up}/4) antes de reintentar: {e}"
-                ),
-            )
+    archivo_subido = _subir_archivo_gemini_activo(
+        client,
+        ruta_archivo,
+        on_log=on_log,
+        on_estado=lambda frac, det: _emitir_gem(frac, modelo_inicial, det, forzar=(frac <= 0.2)),
+    )
 
     try:
-        estado = _obtener_estado_archivo(archivo_subido)
-        _log(f"Subido con ID {archivo_subido.name}. Estado inicial: {estado}. Esperando procesamiento...")
-        _emitir_gem(0.18, modelo_inicial, f"Procesando audio en File API ({estado})...", forzar=True)
-        intentos_estado = 0
-        while estado != "ACTIVE":
-            if estado == "FAILED":
-                raise RuntimeError(f"Fallo al procesar archivo en Gemini: {estado}")
-            intentos_estado += 1
-            if intentos_estado > 150:
-                raise TimeoutError("Tiempo de espera agotado esperando estado ACTIVE en File API.")
-            time.sleep(4)
-            try:
-                archivo_subido = client.files.get(name=archivo_subido.name)
-                estado = _obtener_estado_archivo(archivo_subido)
-                _log(f"Estado actual del archivo: {estado}")
-                _emitir_gem(
-                    min(0.30, 0.18 + intentos_estado * 0.01),
-                    modelo_inicial,
-                    f"Esperando File API ({estado})...",
-                )
-            except Exception as e_get:
-                _log(f"[AVISO] Error transitorio consultando estado del archivo: {e_get}")
-        _log("✓ Archivo de audio listo y activo para inferencia.")
-
         prompt = construir_prompt_viral(duracion_bloque)
-
-        orden_modelos = list(MODELOS_CANDIDATOS)
-        if modelo_preferido and modelo_preferido.strip():
-            pref = modelo_preferido.strip()
-            orden_modelos = [pref] + [m for m in orden_modelos if m != pref]
-
-        clips: Optional[List[dict]] = None
-        modelo_usado: Optional[str] = None
-        max_intentos = 4
-
-        for modelo in orden_modelos:
-            _log(f"Probando análisis en streaming con: {modelo}...")
-            _emitir_gem(0.35, modelo, f"Iniciando inferencia streaming ({modelo})...", forzar=True)
-            for intento in range(1, max_intentos + 1):
-                accion_siguiente = (
-                    "reintentar" if intento < max_intentos else "saltar al siguiente modelo"
-                )
-                try:
-                    partes_texto: List[str] = []
-                    chars_recibidos = 0
-                    stream = client.models.generate_content_stream(
-                        model=modelo,
-                        contents=[archivo_subido, prompt],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=list[ClipViral],
-                            temperature=0.20,
-                        ),
-                    )
-                    for chunk in stream:
-                        txt_chunk = getattr(chunk, "text", None)
-                        if txt_chunk:
-                            partes_texto.append(txt_chunk)
-                            chars_recibidos += len(txt_chunk)
-                            frac_stream = min(0.92, 0.40 + (chars_recibidos / 8000.0) * 0.52)
-                            _emitir_gem(
-                                frac_stream,
-                                modelo,
-                                f"Recibiendo respuesta JSON ({chars_recibidos} chars)...",
-                            )
-
-                    texto_respuesta = "".join(partes_texto).strip()
-                    if not texto_respuesta:
-                        raise ValueError("Respuesta vacía recibida desde el stream de Gemini.")
-
-                    clips = _limpiar_y_parsear_json(
-                        texto_respuesta,
-                        duracion_total=duracion_bloque,
-                        permitir_vacio=True,
-                    )
-                    modelo_usado = modelo
-                    _log(f"✓ Análisis generado con éxito usando {modelo} ({len(clips)} clips)")
-                    _emitir_gem(1.0, modelo, f"Completado con {modelo} ({len(clips)} clips)", forzar=True)
-                    break
-                except ServerError as e:
-                    codigo_err = getattr(e, "code", None) or 503
-                    _esperar_con_jitter(
-                        intento,
-                        base=4.0,
-                        max_espera=25.0,
-                        on_log=on_log,
-                        contexto=(
-                            f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
-                            f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {e}"
-                        ),
-                    )
-                except APIError as e:
-                    codigo_err = getattr(e, "code", None) or "APIError"
-                    detalle_err = getattr(e, "message", None) or str(e)
-                    if _es_error_cuota_diaria_free_tier(e):
-                        _log(
-                            f"[AVISO] Cuota diaria gratuita agotada para {modelo} (código 429, "
-                            f"espera 0.00s): saltando inmediatamente al siguiente modelo. Detalle: {detalle_err}"
-                        )
-                        break
-                    if codigo_err in (400, 404):
-                        _log(
-                            f"[AVISO] Modelo {modelo} falló (código {codigo_err}, espera 0.00s "
-                            f"antes de saltar al siguiente modelo): {detalle_err}"
-                        )
-                        break
-                    if codigo_err in (429, 503):
-                        _esperar_con_jitter(
-                            intento,
-                            base=4.0,
-                            max_espera=25.0,
-                            on_log=on_log,
-                            contexto=(
-                                f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
-                                f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {detalle_err}"
-                            ),
-                        )
-                    else:
-                        _log(
-                            f"[AVISO] Modelo {modelo} falló (código {codigo_err}, espera 0.00s "
-                            f"antes de saltar al siguiente modelo): {detalle_err}"
-                        )
-                        break
-                except Exception as e:
-                    codigo_err = type(e).__name__
-                    _esperar_con_jitter(
-                        intento,
-                        base=4.0,
-                        max_espera=25.0,
-                        on_log=on_log,
-                        contexto=(
-                            f"[AVISO] Modelo {modelo} falló (error {codigo_err}, "
-                            f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {e}"
-                        ),
-                    )
-            if clips is not None:
-                break
-
-        if clips is None:
-            raise RuntimeError("No se pudo obtener una respuesta JSON válida de los modelos disponibles.")
+        clips, modelo_usado = _ejecutar_cascada_modelos_gemini(
+            client=client,
+            archivo_subido=archivo_subido,
+            prompt=prompt,
+            response_schema=list[ClipViral],
+            temperature=0.20,
+            parsear_fn=lambda txt: _limpiar_y_parsear_json(
+                txt,
+                duracion_total=duracion_bloque,
+                permitir_vacio=True,
+            ),
+            modelo_preferido=modelo_preferido,
+            on_log=on_log,
+            on_modelo_inicio=lambda mod: _emitir_gem(
+                0.35, mod, f"Iniciando inferencia streaming ({mod})...", forzar=True
+            ),
+            on_chunk_texto=lambda mod, chars: _emitir_gem(
+                min(0.92, 0.40 + (chars / 8000.0) * 0.52),
+                mod,
+                f"Recibiendo respuesta JSON ({chars} chars)...",
+            ),
+        )
+        _log(f"✓ Análisis generado con éxito usando {modelo_usado} ({len(clips)} clips)")
+        _emitir_gem(1.0, modelo_usado, f"Completado con {modelo_usado} ({len(clips)} clips)", forzar=True)
 
         for c in clips:
             c["modelo_ia"] = modelo_usado
@@ -1616,12 +1849,15 @@ def analizar_con_gemini(
     on_log: Optional[Callable[[str], None]] = None,
     on_telemetria: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[dict]:
-    """Segmenta audios largos (>55 min) si aplica, sube a Gemini File API, consolida offsets y guarda clips.json."""
+    """Segmenta audios largos (>30 min), analiza bloques en paralelo con Gemini File API y guarda clips.json."""
+    log_lock = threading.Lock()
+
     def _log(msg: str) -> None:
-        if on_log is not None:
-            on_log(msg)
-        else:
-            print(msg)
+        with log_lock:
+            if on_log is not None:
+                on_log(msg)
+            else:
+                print(msg)
 
     _log("\n[2/4] Subiendo audio a Gemini y ejecutando análisis viral con IA...")
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -1648,7 +1884,9 @@ def analizar_con_gemini(
             "titulo_etapa": f"Preparando Análisis IA ({modelo_label})",
             "porcentaje": 0.0,
             "bloque_actual": 1,
+            "bloques_completados": 0,
             "total_bloques": 1,
+            "bloques_activos": [],
             "modelo_ia": modelo_label,
             "eta": "--:--",
             "detalle": "Evaluando duración de pista para segmentación...",
@@ -1671,43 +1909,86 @@ def analizar_con_gemini(
 
         if len(chunks) > 1 and duracion_efectiva is not None:
             _log(
-                f"Audio de {segundos_a_hhmmss(duracion_efectiva)} (> 55 min): "
-                f"segmentando en {len(chunks)} bloques de hasta 45 min con 90s de solapamiento..."
+                f"Audio de {segundos_a_hhmmss(duracion_efectiva)} (> 30 min): "
+                f"segmentando en {len(chunks)} bloques de hasta 25 min con 60s de solapamiento (máx. 3 en paralelo)..."
             )
 
-        clips_acumulados: List[dict] = []
-        ultimo_error: Optional[Exception] = None
         total_bloques = len(chunks)
         acepta_tele = _acepta_kwarg(_analizar_archivo_audio_gemini, "on_telemetria")
+        tele_lock = threading.Lock()
+        ultimo_ts_tele = [0.0]
+        bloques_completados = 0
+        bloques_activos_map: Dict[int, str] = {}
+        clips_acumulados: List[dict] = []
+        errores_por_bloque: List[Tuple[int, Exception]] = []
 
-        for idx_chunk, (ruta_chunk, offset_seg, dur_chunk) in enumerate(chunks, start=1):
+        def _construir_estado_telemetria(
+            idx_ref: int,
+            modelo_act: str,
+            detalle: str,
+        ) -> Dict[str, Any]:
+            activos = [bloques_activos_map[k] for k in sorted(bloques_activos_map)]
+            pct = round(min(100.0, max(0.0, (bloques_completados / max(1, total_bloques)) * 100.0)), 1)
+            return {
+                "etapa": "gemini",
+                "titulo_etapa": f"Analizando Narrativa Viral ({modelo_act})",
+                "porcentaje": pct,
+                "bloque_actual": idx_ref,
+                "bloques_completados": bloques_completados,
+                "total_bloques": total_bloques,
+                "bloques_activos": activos,
+                "modelo_ia": modelo_act,
+                "eta": "--:--",
+                "detalle": detalle,
+            }
+
+        def _emitir_bloque_seguro(
+            idx_ref: int,
+            modelo_act: str,
+            detalle: str,
+            forzar: bool = False,
+        ) -> None:
+            if on_telemetria is None:
+                return
+            with tele_lock:
+                datos = _construir_estado_telemetria(idx_ref, modelo_act, detalle)
+                _emitir_telemetria(on_telemetria, ultimo_ts_tele, datos, forzar=forzar)
+
+        def _procesar_bloque(
+            idx_chunk: int,
+            ruta_chunk: str,
+            offset_seg: float,
+            dur_chunk: Optional[float],
+        ) -> None:
+            nonlocal bloques_completados
+            etiqueta_bloque = f"Bloque {idx_chunk}/{total_bloques}"
             if len(chunks) > 1 and dur_chunk is not None:
                 _log(
                     f"Analizando bloque {idx_chunk}/{total_bloques} "
                     f"[{segundos_a_hhmmss(offset_seg)} -> {segundos_a_hhmmss(offset_seg + dur_chunk)}]..."
                 )
-            _emitir_telemetria(
-                on_telemetria,
-                [0.0],
-                {
-                    "etapa": "gemini",
-                    "titulo_etapa": f"Analizando Narrativa Viral ({modelo_label})",
-                    "porcentaje": round(((idx_chunk - 1) / max(1, total_bloques)) * 100.0, 1),
-                    "bloque_actual": idx_chunk,
-                    "total_bloques": total_bloques,
-                    "modelo_ia": modelo_label,
-                    "eta": "--:--",
-                    "detalle": (
-                        f"Bloque {idx_chunk}/{total_bloques}"
-                        + (
-                            f" [{segundos_a_hhmmss(offset_seg)} → {segundos_a_hhmmss(offset_seg + dur_chunk)}]"
-                            if dur_chunk is not None
-                            else ""
-                        )
-                    ),
-                },
-                forzar=True,
-            )
+
+            with tele_lock:
+                bloques_activos_map[idx_chunk] = etiqueta_bloque
+                activos_txt = ", ".join(bloques_activos_map[k] for k in sorted(bloques_activos_map))
+                rango_txt = (
+                    f" [{segundos_a_hhmmss(offset_seg)} → {segundos_a_hhmmss(offset_seg + dur_chunk)}]"
+                    if dur_chunk is not None
+                    else ""
+                )
+                datos_ini = _construir_estado_telemetria(
+                    idx_chunk,
+                    modelo_label,
+                    f"En curso: {activos_txt}{rango_txt}",
+                )
+                _emitir_telemetria(on_telemetria, ultimo_ts_tele, datos_ini, forzar=True)
+
+            def _on_tele_worker(datos_sub: Dict[str, Any]) -> None:
+                mod_sub = str(datos_sub.get("modelo_ia") or modelo_label)
+                det_sub = str(datos_sub.get("detalle") or etiqueta_bloque)
+                _emitir_bloque_seguro(idx_chunk, mod_sub, det_sub, forzar=False)
+
+            clips_chunk: List[dict] = []
             try:
                 if acepta_tele:
                     clips_chunk = _analizar_archivo_audio_gemini(
@@ -1716,7 +1997,7 @@ def analizar_con_gemini(
                         dur_chunk,
                         modelo_preferido,
                         _log,
-                        on_telemetria=on_telemetria,
+                        on_telemetria=_on_tele_worker,
                         bloque_actual=idx_chunk,
                         total_bloques=total_bloques,
                     )
@@ -1729,29 +2010,21 @@ def analizar_con_gemini(
                         _log,
                     )
             except Exception as e_chunk:
-                ultimo_error = e_chunk
-                if len(chunks) == 1:
-                    raise
-                _log(f"[AVISO] Falló análisis del bloque {idx_chunk}/{total_bloques}: {e_chunk}")
-                continue
+                with tele_lock:
+                    errores_por_bloque.append((idx_chunk, e_chunk))
+                    bloques_activos_map.pop(idx_chunk, None)
+                    bloques_completados += 1
+                    datos_err = _construir_estado_telemetria(
+                        idx_chunk,
+                        modelo_label,
+                        f"{etiqueta_bloque} falló ({type(e_chunk).__name__})",
+                    )
+                    _emitir_telemetria(on_telemetria, ultimo_ts_tele, datos_err, forzar=True)
+                if len(chunks) > 1:
+                    _log(f"[AVISO] Falló análisis del {etiqueta_bloque}: {e_chunk}")
+                return
 
-            if not acepta_tele:
-                _emitir_telemetria(
-                    on_telemetria,
-                    [0.0],
-                    {
-                        "etapa": "gemini",
-                        "titulo_etapa": f"Analizando Narrativa Viral ({modelo_label})",
-                        "porcentaje": round((idx_chunk / max(1, total_bloques)) * 100.0, 1),
-                        "bloque_actual": idx_chunk,
-                        "total_bloques": total_bloques,
-                        "modelo_ia": modelo_label,
-                        "eta": "--:--",
-                        "detalle": f"Bloque {idx_chunk}/{total_bloques} completado ({len(clips_chunk)} clips)",
-                    },
-                    forzar=True,
-                )
-
+            clips_bloque_ajustados: List[dict] = []
             for clip in clips_chunk:
                 try:
                     ini_abs = max(0.0, hhmmss_a_segundos(clip["inicio"]) + offset_seg)
@@ -1781,12 +2054,36 @@ def analizar_con_gemini(
                     clip_ajustado.get("subtitulos"), dur_normalizada
                 )
                 clip_ajustado["subtitulos"] = [s.model_dump() for s in subs_validados]
-                clips_acumulados.append(clip_ajustado)
+                clips_bloque_ajustados.append(clip_ajustado)
+
+            with tele_lock:
+                clips_acumulados.extend(clips_bloque_ajustados)
+                bloques_activos_map.pop(idx_chunk, None)
+                bloques_completados += 1
+                activos_rest = [bloques_activos_map[k] for k in sorted(bloques_activos_map)]
+                sufijo = f" • Activos: {', '.join(activos_rest)}" if activos_rest else ""
+                datos_fin = _construir_estado_telemetria(
+                    idx_chunk,
+                    modelo_label,
+                    f"{etiqueta_bloque} completado ({len(clips_chunk)} clips){sufijo}",
+                )
+                _emitir_telemetria(on_telemetria, ultimo_ts_tele, datos_fin, forzar=True)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futuros = [
+                executor.submit(_procesar_bloque, idx_c, ruta_c, off_c, dur_c)
+                for idx_c, (ruta_c, off_c, dur_c) in enumerate(chunks, start=1)
+            ]
+            for fut in futuros:
+                fut.result()
+
+        if len(chunks) == 1 and errores_por_bloque:
+            raise errores_por_bloque[0][1]
 
         clips_finales = _deduplicar_clips_solapados(clips_acumulados)
         if not clips_finales:
-            if ultimo_error is not None:
-                raise ultimo_error
+            if errores_por_bloque:
+                raise errores_por_bloque[-1][1]
             raise RuntimeError("No se detectaron clips virales válidos en ninguno de los bloques del audio.")
 
         _guardar_y_sincronizar_clips(clips_finales, job_dir=job_dir)
@@ -1806,6 +2103,888 @@ def analizar_con_gemini(
                     os.remove(resto_chunk)
                 except OSError:
                     pass
+
+
+def _resolver_ollama_url() -> str:
+    """Resuelve la URL base de Ollama respetando OLLAMA_HOST o OLLAMA_BASE_URL."""
+    raw = (os.environ.get("OLLAMA_HOST") or OLLAMA_BASE_URL or "http://127.0.0.1:11434").strip()
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    return raw.rstrip("/")
+
+
+def _normalizar_modelo_ollama(nombre: Optional[str]) -> str:
+    """Devuelve un nombre de modelo Ollama válido priorizando el valor por defecto v4.1."""
+    limpio = str(nombre or "").strip()
+    return limpio or MODELOS_LOCALES_OLLAMA[0]
+
+
+def _modelo_instalado_en_ollama(modelo: str, instalados: Sequence[str]) -> bool:
+    """Comprueba coincidencia exacta o con sufijo ':latest' dentro de los tags instalados."""
+    objetivo = modelo.strip()
+    conjunto = {str(m).strip() for m in instalados if str(m).strip()}
+    if objetivo in conjunto:
+        return True
+    if f"{objetivo}:latest" in conjunto:
+        return True
+    if objetivo.endswith(":latest") and objetivo[:-7] in conjunto:
+        return True
+    return False
+
+
+def listar_modelos_ollama_disponibles() -> List[str]:
+    """Lista los modelos instalados en Ollama priorizando MODELOS_LOCALES_OLLAMA sin lanzar excepciones."""
+    url = f"{_resolver_ollama_url()}/api/tags"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return list(MODELOS_LOCALES_OLLAMA)
+
+    crudos: List[str] = []
+    for item in payload.get("models", []) if isinstance(payload, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        nombre = str(item.get("name") or item.get("model") or "").strip()
+        if nombre and nombre not in crudos:
+            crudos.append(nombre)
+
+    if not crudos:
+        return list(MODELOS_LOCALES_OLLAMA)
+
+    ordenados: List[str] = []
+    for pref in MODELOS_LOCALES_OLLAMA:
+        for candidato in crudos:
+            if candidato == pref or candidato == f"{pref}:latest":
+                if candidato not in ordenados:
+                    ordenados.append(candidato)
+                break
+    for restante in crudos:
+        if "embed" in restante.lower():
+            continue
+        if restante not in ordenados:
+            ordenados.append(restante)
+    return ordenados or list(MODELOS_LOCALES_OLLAMA)
+
+
+def _asegurar_modelo_ollama(
+    modelo_local: str,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Verifica conexión con Ollama y descarga automáticamente el modelo si aún no está en disco."""
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+
+    modelo = _normalizar_modelo_ollama(modelo_local)
+    base_url = _resolver_ollama_url()
+    tags_url = f"{base_url}/api/tags"
+    try:
+        req = urllib.request.Request(tags_url, method="GET")
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as e:
+        raise RuntimeError(
+            "Ollama no está activo en 127.0.0.1:11434. Inícialo con 'ollama serve' o 'systemctl start ollama'."
+        ) from e
+
+    instalados = [
+        str(m.get("name") or m.get("model") or "").strip()
+        for m in (payload.get("models", []) if isinstance(payload, dict) else [])
+        if isinstance(m, dict)
+    ]
+    if _modelo_instalado_en_ollama(modelo, instalados):
+        return
+
+    _log(f"Modelo Ollama '{modelo}' no encontrado en disco. Ejecutando descarga automática (/api/pull)...")
+    pull_req = urllib.request.Request(
+        f"{base_url}/api/pull",
+        data=json.dumps({"name": modelo, "stream": True}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    ultimo_pct_log = -10
+    ultimo_estado = ""
+    with urllib.request.urlopen(pull_req, timeout=1800.0) as resp:
+        for raw_line in resp:
+            linea = raw_line.decode("utf-8", errors="replace").strip()
+            if not linea:
+                continue
+            try:
+                evento = json.loads(linea)
+            except json.JSONDecodeError:
+                continue
+            if evento.get("error"):
+                raise RuntimeError(f"Error descargando modelo Ollama '{modelo}': {evento['error']}")
+            estado = str(evento.get("status") or "").strip()
+            total_b = evento.get("total")
+            comp_b = evento.get("completed")
+            if isinstance(total_b, (int, float)) and total_b > 0 and isinstance(comp_b, (int, float)):
+                pct = int(round((comp_b / total_b) * 100))
+                if pct >= ultimo_pct_log + 10 or pct >= 100:
+                    ultimo_pct_log = pct
+                    _log(f"  Descargando {modelo}: {pct}% ({estado})")
+            elif estado and estado != ultimo_estado:
+                ultimo_estado = estado
+                _log(f"  Ollama pull {modelo}: {estado}")
+    _log(f"✓ Modelo Ollama '{modelo}' descargado y listo.")
+
+
+def _descargar_modelo_ollama_ram(
+    modelo_local: str,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Fuerza la descarga de RAM del modelo Ollama mediante keep_alive=0 antes de lanzar FFmpeg."""
+    modelo = _normalizar_modelo_ollama(modelo_local)
+    base_url = _resolver_ollama_url()
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/api/generate",
+            data=json.dumps(
+                {"model": modelo, "prompt": "", "keep_alive": 0, "stream": False}
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            resp.read()
+        msg = f"Memoria RAM de Ollama liberada tras análisis ({modelo}, keep_alive=0)."
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+    except Exception:
+        pass
+    finally:
+        gc.collect()
+
+
+def _calcular_energia_segmentos_audio(
+    ruta_audio: str,
+    segmentos: List[Dict[str, Any]],
+) -> Set[int]:
+    """Calcula RMS PCM mono 12kHz por segmento y detecta picos vocales >= 1.65x mediana global."""
+    if not segmentos or not ruta_audio:
+        return set()
+
+    sr = 12000
+    comando = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(ruta_audio),
+        "-f",
+        "s16le",
+        "-ac",
+        "1",
+        "-ar",
+        str(sr),
+        "-",
+    ]
+    try:
+        proc = subprocess.run(comando, capture_output=True, check=False)
+    except OSError:
+        return set()
+
+    if proc.returncode != 0 or not proc.stdout:
+        return set()
+
+    n_bytes = len(proc.stdout) - (len(proc.stdout) % 2)
+    if n_bytes < 2:
+        return set()
+
+    muestras = array.array("h")
+    muestras.frombytes(proc.stdout[:n_bytes])
+    if sys.byteorder != "little":
+        muestras.byteswap()
+
+    total_muestras = len(muestras)
+    rms_por_seg: List[float] = []
+    for seg in segmentos:
+        try:
+            ini = float(seg.get("start", 0.0) or 0.0)
+            fin = float(seg.get("end", ini) or ini)
+        except (TypeError, ValueError):
+            rms_por_seg.append(0.0)
+            continue
+        i0 = max(0, min(total_muestras, int(ini * sr)))
+        i1 = max(i0, min(total_muestras, int(fin * sr)))
+        n = i1 - i0
+        if n <= 0:
+            rms_por_seg.append(0.0)
+            continue
+        tramo = muestras[i0:i1]
+        energia = sum(map(int.__mul__, tramo, tramo)) / n
+        rms_por_seg.append(math.sqrt(energia))
+
+    positivos = [r for r in rms_por_seg if r > 0.0]
+    if not positivos:
+        return set()
+
+    mediana_global = statistics.median(positivos)
+    if mediana_global <= 0.0:
+        return set()
+
+    umbral = mediana_global * 1.65
+    return {idx for idx, rms in enumerate(rms_por_seg) if rms >= umbral and rms > 0.0}
+
+
+def _decodificar_audio_pcm_16k(ruta_audio: str) -> Any:
+    """Decodifica audio a mono float32 16 kHz vía FFmpeg para evitar bugs de PyAV >= 19 en faster-whisper."""
+    try:
+        ruta_obj = Path(ruta_audio)
+        if not ruta_obj.is_file() or ruta_obj.stat().st_size < 64:
+            return ruta_audio
+        import numpy as np  # dependencia transitiva de faster-whisper
+    except (OSError, ImportError):
+        return ruta_audio
+
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(ruta_obj),
+                "-f",
+                "f32le",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=900,
+        )
+        n_samples = len(proc.stdout) // 4 if proc.stdout else 0
+        if proc.returncode == 0 and n_samples >= 1:
+            return np.frombuffer(proc.stdout, dtype=np.float32, count=n_samples)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ruta_audio
+
+
+def _transcribir_audio_whisper_local(
+    ruta_audio: str,
+    job_dir: Optional[Path] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+    on_telemetria: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """Transcribe audio offline con faster-whisper medium int8 y timestamps por palabra + cache."""
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+
+    cache_path = (Path(job_dir).resolve() / "whisper_transcript.json") if job_dir else None
+    ultimo_ts = [0.0]
+
+    if cache_path and cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(cached, dict)
+                and isinstance(cached.get("segmentos"), list)
+                and cached["segmentos"]
+                and isinstance(cached.get("palabras"), list)
+            ):
+                if "indices_picos" not in cached or cached["indices_picos"] is None:
+                    cached["indices_picos"] = sorted(
+                        _calcular_energia_segmentos_audio(ruta_audio, cached["segmentos"])
+                    )
+                _log(f"✓ Reutilizando transcripción local en caché: {cache_path.name}")
+                _emitir_telemetria(
+                    on_telemetria,
+                    ultimo_ts,
+                    {
+                        "etapa": "local_whisper",
+                        "titulo_etapa": "Transcripción Local (Whisper Medium)",
+                        "porcentaje": 100.0,
+                        "velocidad_red": "Cache Local",
+                        "tamano_total": f"{len(cached['segmentos'])} segs",
+                        "eta": "00:00",
+                        "detalle": "Transcripción local cargada desde disco",
+                    },
+                    forzar=True,
+                )
+                return cached
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+
+    if WhisperModel is None:
+        raise RuntimeError("faster-whisper no está instalado en el entorno virtual.")
+
+    _log(f"Iniciando transcripción local Whisper ({WHISPER_MODEL_SIZE}, int8, CPU)...")
+    _emitir_telemetria(
+        on_telemetria,
+        ultimo_ts,
+        {
+            "etapa": "local_whisper",
+            "titulo_etapa": "Transcripción Local (Whisper Medium)",
+            "porcentaje": 5.0,
+            "velocidad_red": "CPU int8",
+            "tamano_total": "--",
+            "eta": "--:--",
+            "detalle": f"Cargando modelo Whisper {WHISPER_MODEL_SIZE} (int8)...",
+        },
+        forzar=True,
+    )
+
+    cpu_threads = max(4, (os.cpu_count() or 8) - 2)
+    model = WhisperModel(
+        WHISPER_MODEL_SIZE,
+        device="cpu",
+        compute_type="int8",
+        cpu_threads=cpu_threads,
+    )
+
+    segmentos: List[Dict[str, Any]] = []
+    palabras: List[Dict[str, Any]] = []
+    duracion_total = 0.0
+    idioma = "es"
+    entrada_whisper: Any = None
+    try:
+        entrada_whisper = _decodificar_audio_pcm_16k(ruta_audio)
+        segments, info = model.transcribe(
+            entrada_whisper,
+            language="es",
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 600, "speech_pad_ms": 250},
+            word_timestamps=True,
+            condition_on_previous_text=False,
+            initial_prompt="Stream en vivo en Kick Colombia con jerga colombiana: parce, gonorrea, chimba, nea, sisas, marica, pirobo, WestCOL, Blessd, La Liendra, eldomi, Yhap.",
+        )
+        duracion_total = float(getattr(info, "duration", 0.0) or 0.0)
+        idioma = str(getattr(info, "language", "es") or "es")
+        if duracion_total <= 0.0:
+            duracion_total = float(obtener_duracion_media(ruta_audio) or 0.0)
+
+        for seg in segments:
+            texto_seg = str(getattr(seg, "text", "") or "").strip()
+            if not texto_seg:
+                continue
+            ini_s = float(getattr(seg, "start", 0.0) or 0.0)
+            fin_s = float(getattr(seg, "end", ini_s) or ini_s)
+            segmentos.append({"start": ini_s, "end": fin_s, "text": texto_seg})
+            for w in (getattr(seg, "words", None) or []):
+                w_txt = str(getattr(w, "word", "") or "").strip()
+                if w_txt:
+                    palabras.append(
+                        {
+                            "start": float(getattr(w, "start", ini_s) or ini_s),
+                            "end": float(getattr(w, "end", fin_s) or fin_s),
+                            "word": w_txt,
+                        }
+                    )
+
+            pct_est = (
+                min(92.0, max(8.0, 8.0 + (fin_s / duracion_total) * 84.0))
+                if duracion_total > 0.0
+                else min(90.0, 10.0 + len(segmentos) * 1.5)
+            )
+            _emitir_telemetria(
+                on_telemetria,
+                ultimo_ts,
+                {
+                    "etapa": "local_whisper",
+                    "titulo_etapa": "Transcripción Local (Whisper Medium)",
+                    "porcentaje": round(pct_est, 1),
+                    "velocidad_red": "CPU int8",
+                    "tamano_total": f"{len(segmentos)} segs",
+                    "eta": "--:--",
+                    "detalle": f"Transcrito hasta {segundos_a_hhmmss(fin_s)} ({len(palabras)} palabras)",
+                },
+                forzar=False,
+            )
+    finally:
+        entrada_whisper = None
+        del model
+        gc.collect()
+
+    if not segmentos:
+        raise RuntimeError("Whisper local no detectó segmentos de habla válidos en el audio.")
+
+    if duracion_total <= 0.0:
+        duracion_total = max(float(s["end"]) for s in segmentos)
+
+    indices_picos = sorted(_calcular_energia_segmentos_audio(ruta_audio, segmentos))
+    _log(
+        f"✓ Whisper completado: {len(segmentos)} segmentos, {len(palabras)} palabras, "
+        f"{len(indices_picos)} picos vocales detectados. RAM liberada."
+    )
+
+    resultado = {
+        "duracion_total": round(duracion_total, 3),
+        "idioma": idioma,
+        "segmentos": segmentos,
+        "palabras": palabras,
+        "indices_picos": indices_picos,
+    }
+    if cache_path is not None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps(resultado, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    _emitir_telemetria(
+        on_telemetria,
+        ultimo_ts,
+        {
+            "etapa": "local_whisper",
+            "titulo_etapa": "Transcripción Local (Whisper Medium)",
+            "porcentaje": 100.0,
+            "velocidad_red": "CPU int8",
+            "tamano_total": f"{len(segmentos)} segs",
+            "eta": "00:00",
+            "detalle": f"Listo ({len(palabras)} palabras, {len(indices_picos)} picos vocales)",
+        },
+        forzar=True,
+    )
+    return resultado
+
+
+def _construir_subtitulos_desde_whisper(
+    palabras: Sequence[Dict[str, Any]],
+    inicio_seg: float,
+    fin_seg: float,
+    segmentos: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Construye bloques de 2 a 4 palabras sincronizados al milímetro desde word_timestamps de Whisper."""
+    duracion_clip = max(0.2, float(fin_seg) - float(inicio_seg))
+    palabras_clip: List[Dict[str, Any]] = []
+
+    for w in palabras or []:
+        if not isinstance(w, dict):
+            continue
+        txt = str(w.get("word") or "").strip()
+        if not txt:
+            continue
+        try:
+            w_ini = float(w.get("start", 0.0) or 0.0)
+            w_fin = float(w.get("end", w_ini + 0.1) or (w_ini + 0.1))
+        except (TypeError, ValueError):
+            continue
+        if w_fin < inicio_seg - 0.15 or w_ini > fin_seg + 0.15:
+            continue
+        ini_rel = max(0.0, min(duracion_clip - 0.08, w_ini - inicio_seg))
+        fin_rel = max(ini_rel + 0.08, min(duracion_clip, w_fin - inicio_seg))
+        palabras_clip.append({"start": ini_rel, "end": fin_rel, "word": txt})
+
+    bloques_raw: List[Dict[str, Any]] = []
+    if palabras_clip:
+        buf: List[Dict[str, Any]] = []
+
+        def _volcar_buffer() -> None:
+            if not buf:
+                return
+            t_ini = buf[0]["start"]
+            t_fin = max(t_ini + 0.15, buf[-1]["end"])
+            if bloques_raw and t_ini < bloques_raw[-1]["fin_rel"]:
+                t_ini = min(duracion_clip - 0.08, bloques_raw[-1]["fin_rel"])
+                t_fin = max(t_ini + 0.08, min(duracion_clip, t_fin))
+            texto_bloque = " ".join(p["word"] for p in buf).strip()
+            if texto_bloque:
+                bloques_raw.append(
+                    {
+                        "inicio_rel": round(t_ini, 3),
+                        "fin_rel": round(min(duracion_clip, t_fin), 3),
+                        "texto": texto_bloque,
+                    }
+                )
+            buf.clear()
+
+        for idx, pw in enumerate(palabras_clip):
+            buf.append(pw)
+            texto_actual = " ".join(p["word"] for p in buf)
+            siguiente = palabras_clip[idx + 1] if idx + 1 < len(palabras_clip) else None
+            pausa_sig = (siguiente["start"] - pw["end"]) if siguiente else 0.0
+            termina_puntuacion = pw["word"].endswith((".", "!", "?", ";", ":"))
+            largo_siguiente = (
+                len(texto_actual) + 1 + len(siguiente["word"]) if siguiente else 0
+            )
+            if (
+                siguiente is None
+                or len(buf) >= 4
+                or pausa_sig >= 0.45
+                or (len(buf) >= 2 and (termina_puntuacion or largo_siguiente > 24))
+            ):
+                _volcar_buffer()
+    elif segmentos:
+        for seg in segmentos:
+            if not isinstance(seg, dict):
+                continue
+            txt = str(seg.get("text") or "").strip()
+            if not txt:
+                continue
+            s_ini = float(seg.get("start", 0.0) or 0.0)
+            s_fin = float(seg.get("end", s_ini) or s_ini)
+            if s_fin <= inicio_seg or s_ini >= fin_seg:
+                continue
+            ini_rel = max(0.0, s_ini - inicio_seg)
+            fin_rel = min(duracion_clip, s_fin - inicio_seg)
+            if fin_rel > ini_rel + 0.1:
+                bloques_raw.append(
+                    {"inicio_rel": round(ini_rel, 3), "fin_rel": round(fin_rel, 3), "texto": txt}
+                )
+
+    if not bloques_raw:
+        return []
+    subs_norm = _normalizar_subtitulos(bloques_raw, duracion_clip)
+    return [s.model_dump() for s in subs_norm]
+
+
+def _segmentar_transcripcion_para_ollama(
+    segmentos: Sequence[Dict[str, Any]],
+    indices_picos: Set[int],
+    duracion_total: float,
+    max_duracion_bloque: float = 900.0,
+    solapamiento: float = 60.0,
+    max_segmentos_bloque: int = 180,
+) -> List[Dict[str, Any]]:
+    """Divide transcripciones largas en bloques temporales manejables para RAM local (16 GB)."""
+    segs_indexados = [(idx, seg) for idx, seg in enumerate(segmentos)]
+    if not segs_indexados:
+        return []
+
+    dur_eff = max(float(duracion_total or 0.0), max(float(s["end"]) for _, s in segs_indexados))
+
+    def _formatear_bloque(
+        subset: List[Tuple[int, Dict[str, Any]]],
+        offset: float,
+        dur_b: float,
+    ) -> Dict[str, Any]:
+        lineas: List[str] = []
+        for idx_orig, s in subset:
+            ini_r = max(0.0, float(s.get("start", 0.0)) - offset)
+            fin_r = max(ini_r, float(s.get("end", ini_r)) - offset)
+            marca_pico = " [🔥 ALTA INTENSIDAD VOCAL]" if idx_orig in indices_picos else ""
+            txt = str(s.get("text") or "").strip()
+            lineas.append(f"[{segundos_a_hhmmss(ini_r)} - {segundos_a_hhmmss(fin_r)}]{marca_pico} {txt}")
+        return {
+            "offset_seg": offset,
+            "duracion_bloque": max(5.0, dur_b),
+            "texto": "\n".join(lineas),
+            "num_segmentos": len(subset),
+        }
+
+    if dur_eff <= 1200.0 and len(segs_indexados) <= max_segmentos_bloque:
+        return [_formatear_bloque(segs_indexados, 0.0, dur_eff)]
+
+    bloques: List[Dict[str, Any]] = []
+    paso = max(120.0, max_duracion_bloque - solapamiento)
+    inicio_w = 0.0
+    while inicio_w < dur_eff - 1.0:
+        fin_w = min(dur_eff, inicio_w + max_duracion_bloque)
+        subset = [
+            (idx_o, s)
+            for idx_o, s in segs_indexados
+            if float(s.get("end", 0.0)) > inicio_w and float(s.get("start", 0.0)) < fin_w
+        ]
+        if subset:
+            if len(subset) > max_segmentos_bloque:
+                for pos in range(0, len(subset), max_segmentos_bloque):
+                    sub_recorte = subset[pos : pos + max_segmentos_bloque]
+                    sub_off = max(0.0, float(sub_recorte[0][1].get("start", 0.0)))
+                    sub_fin = max(sub_off + 5.0, float(sub_recorte[-1][1].get("end", sub_off + 5.0)))
+                    bloques.append(_formatear_bloque(sub_recorte, sub_off, sub_fin - sub_off))
+            else:
+                bloques.append(_formatear_bloque(subset, inicio_w, fin_w - inicio_w))
+        if fin_w >= dur_eff:
+            break
+        inicio_w += paso
+    return bloques
+
+
+def _construir_prompt_ollama(transcripcion_bloque: str, duracion_bloque: float) -> str:
+    """Construye el prompt especializado en curaduría viral para modelos locales Ollama."""
+    dur_str = segundos_a_hhmmss(duracion_bloque)
+    if duracion_bloque < 90:
+        rango_clips = "1 a 3 clips virales (respetando la duración real disponible)"
+        min_seg = max(5, min(15, int(duracion_bloque * 0.45)))
+    elif duracion_bloque < 420:
+        rango_clips = "2 a 5 clips virales"
+        min_seg = 15
+    else:
+        rango_clips = "3 a 6 clips virales"
+        min_seg = 18
+
+    return (
+        "Eres el editor jefe viral del canal Kicksazos (YouTube Shorts y TikTok de Kick Colombia: "
+        "WestCOL, Blessd, La Liendra, eldomi, Yhap, streamers colombianos).\n"
+        f"Analiza esta transcripción cronológica del audio (duración del bloque: {dur_str}) y selecciona {rango_clips}.\n\n"
+        "REGLAS ESTRICTAS DE CURADURÍA:\n"
+        "1. PRIORIZA momentos marcados con [🔥 ALTA INTENSIDAD VOCAL] (gritos, risas explosivas, peleas, clímax emocionales), confesiones polémicas o remates con retención inmediata.\n"
+        f"2. Cada clip debe durar entre {min_seg} y 58 segundos (ideal 20–50s) y usar timestamps EXACTOS presentes en esta transcripción en formato HH:MM:SS.\n"
+        "3. `gancho`: primeras palabras literales habladas en los primeros 2 segundos del clip seleccionado.\n"
+        "4. `titulo`: máximo 60 caracteres, estilo streamer colombiano con alto CTR.\n"
+        "5. `caption_tiktok`: <= 150 caracteres con gancho de debate; `hashtags_tiktok`: 3 a 5 hashtags; `etiquetas`: 8 a 12 tags SEO relevantes.\n"
+        "6. Responde EXCLUSIVAMENTE un objeto JSON válido con la clave raíz `clips` siguiendo el esquema solicitado. NO incluyas subtítulos ni explicaciones fuera del JSON.\n\n"
+        f"TRANSCRIPCIÓN:\n{transcripcion_bloque}"
+    )
+
+
+def _llamar_ollama_chat(
+    modelo_local: str,
+    prompt: str,
+    num_ctx: int = 8192,
+    on_chunk_texto: Optional[Callable[[int], None]] = None,
+) -> str:
+    """Ejecuta POST /api/chat en modo streaming evitando timeout y limpiando bloques think."""
+    base_url = _resolver_ollama_url()
+    chat_url = f"{base_url}/api/chat"
+    schema = ListaClipsLocal.model_json_schema()
+    es_thinking = any(
+        pref in modelo_local.lower() for pref in ("qwen3", "deepseek-r1", "qwq")
+    )
+
+    def _hacer_peticion(incluir_think_false: bool) -> str:
+        payload: Dict[str, Any] = {
+            "model": modelo_local,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+            "format": schema,
+            "keep_alive": "3m",
+            "options": {"temperature": 0.25, "num_ctx": num_ctx},
+        }
+        if incluir_think_false:
+            payload["think"] = False
+
+        req = urllib.request.Request(
+            chat_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        partes_contenido: List[str] = []
+        chars = 0
+        with urllib.request.urlopen(req, timeout=600.0) as resp:
+            for raw_line in resp:
+                linea = raw_line.decode("utf-8", errors="replace").strip()
+                if not linea:
+                    continue
+                try:
+                    evento = json.loads(linea)
+                except json.JSONDecodeError:
+                    continue
+                if evento.get("error"):
+                    raise RuntimeError(f"Ollama error ({modelo_local}): {evento['error']}")
+                msg = evento.get("message") or {}
+                txt = msg.get("content") or ""
+                if txt:
+                    partes_contenido.append(txt)
+                    chars += len(txt)
+                    if on_chunk_texto is not None:
+                        on_chunk_texto(chars)
+                if evento.get("done") is True:
+                    break
+        return "".join(partes_contenido).strip()
+
+    try:
+        return _hacer_peticion(incluir_think_false=es_thinking)
+    except urllib.error.HTTPError as e:
+        detalle = ""
+        try:
+            detalle = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            detalle = str(e)
+        if e.code == 400 and es_thinking and "think" in detalle.lower():
+            return _hacer_peticion(incluir_think_false=False)
+        raise RuntimeError(f"Ollama HTTP {e.code} ({modelo_local}): {detalle}") from e
+
+
+def analizar_con_ollama(
+    ruta_audio: str,
+    modelo_local: Optional[str] = None,
+    duracion_total: Optional[float] = None,
+    job_dir: Optional[Path | str] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+    on_telemetria: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> List[dict]:
+    """Analiza un audio 100% offline usando Whisper medium + Ollama secuencial con gestión estricta de RAM."""
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+
+    modelo_elegido = _normalizar_modelo_ollama(modelo_local)
+    _asegurar_modelo_ollama(modelo_elegido, on_log=_log)
+
+    dir_job = Path(job_dir).resolve() if job_dir else BASE_DIR
+    transcripcion = _transcribir_audio_whisper_local(
+        ruta_audio,
+        job_dir=dir_job,
+        on_log=_log,
+        on_telemetria=on_telemetria,
+    )
+
+    duracion_efectiva = float(
+        duracion_total
+        or transcripcion.get("duracion_total")
+        or obtener_duracion_media(ruta_audio)
+        or 0.0
+    )
+    segmentos = transcripcion.get("segmentos") or []
+    palabras = transcripcion.get("palabras") or []
+    indices_picos = set(int(i) for i in (transcripcion.get("indices_picos") or []))
+
+    bloques = _segmentar_transcripcion_para_ollama(
+        segmentos=segmentos,
+        indices_picos=indices_picos,
+        duracion_total=duracion_efectiva,
+    )
+    if not bloques:
+        raise RuntimeError("No hay contenido transcrito suficiente para analizar con Ollama.")
+
+    _log(
+        f"\n[2/4] Curaduría viral local con Ollama ({modelo_elegido}) en {len(bloques)} bloque(s) secuenciales..."
+    )
+    ultimo_ts = [0.0]
+    clips_acumulados: List[dict] = []
+
+    try:
+        total_b = len(bloques)
+        for idx_b, bloque in enumerate(bloques, start=1):
+            offset_seg = float(bloque["offset_seg"])
+            dur_bloque = float(bloque["duracion_bloque"])
+            prompt = _construir_prompt_ollama(bloque["texto"], dur_bloque)
+            num_ctx = 12288 if len(prompt) > 12000 else 8192
+
+            _emitir_telemetria(
+                on_telemetria,
+                ultimo_ts,
+                {
+                    "etapa": "local_ollama",
+                    "titulo_etapa": f"Curaduría Viral Local ({modelo_elegido})",
+                    "porcentaje": round(((idx_b - 1) / total_b) * 100.0, 1),
+                    "velocidad_red": modelo_elegido,
+                    "tamano_total": f"Bloque {idx_b}/{total_b}",
+                    "eta": "--:--",
+                    "detalle": f"Analizando bloque {idx_b}/{total_b} en Ollama...",
+                },
+                forzar=True,
+            )
+
+            def _on_chunk_local(chars_rx: int, b_idx: int = idx_b, b_tot: int = total_b) -> None:
+                base_pct = ((b_idx - 1) / b_tot) * 100.0
+                pct_avance = min(98.0, base_pct + min(0.95, chars_rx / 2500.0) * (100.0 / b_tot))
+                _emitir_telemetria(
+                    on_telemetria,
+                    ultimo_ts,
+                    {
+                        "etapa": "local_ollama",
+                        "titulo_etapa": f"Curaduría Viral Local ({modelo_elegido})",
+                        "porcentaje": round(pct_avance, 1),
+                        "velocidad_red": modelo_elegido,
+                        "tamano_total": f"{chars_rx} chars",
+                        "eta": "--:--",
+                        "detalle": f"Bloque {b_idx}/{b_tot}: generando JSON ({chars_rx} chars)",
+                    },
+                    forzar=False,
+                )
+
+            clips_bloque: List[dict] = []
+            ultimo_error: Optional[Exception] = None
+            for intento in range(1, 3):
+                try:
+                    texto_resp = _llamar_ollama_chat(
+                        modelo_elegido,
+                        prompt,
+                        num_ctx=num_ctx,
+                        on_chunk_texto=_on_chunk_local,
+                    )
+                    clips_bloque = _limpiar_y_parsear_json(
+                        texto_resp,
+                        duracion_total=dur_bloque,
+                        permitir_vacio=(total_b > 1 and intento == 2),
+                    )
+                    if clips_bloque or total_b > 1:
+                        break
+                    raise ValueError("Ollama devolvió una lista de clips vacía.")
+                except Exception as err_ol:
+                    ultimo_error = err_ol
+                    _log(
+                        f"[AVISO] Ollama ({modelo_elegido}) bloque {idx_b}/{total_b} intento {intento}/2: {err_ol}"
+                    )
+
+            if not clips_bloque and total_b == 1 and ultimo_error is not None:
+                raise ultimo_error
+
+            for clip in clips_bloque:
+                try:
+                    ini_abs = max(0.0, hhmmss_a_segundos(clip["inicio"]) + offset_seg)
+                    fin_abs = max(0.0, hhmmss_a_segundos(clip["fin"]) + offset_seg)
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if duracion_efectiva > 0.0:
+                    if ini_abs >= duracion_efectiva - 2.0:
+                        continue
+                    fin_abs = min(fin_abs, duracion_efectiva)
+                dur_clip_abs = fin_abs - ini_abs
+                if dur_clip_abs < 5.0:
+                    continue
+
+                subs_whisper = _construir_subtitulos_desde_whisper(
+                    palabras,
+                    ini_abs,
+                    fin_abs,
+                    segmentos=segmentos,
+                )
+                clip_enriquecido = dict(clip)
+                clip_enriquecido["inicio"] = segundos_a_hhmmss(ini_abs)
+                clip_enriquecido["fin"] = segundos_a_hhmmss(fin_abs)
+                clip_enriquecido["duracion_segundos"] = int(round(dur_clip_abs))
+                clip_enriquecido["subtitulos"] = subs_whisper
+                clip_enriquecido["subtitulos_origen"] = "whisper_word_timestamps"
+                clip_enriquecido["motor_ia"] = "local"
+                clip_enriquecido["modelo_ia"] = modelo_elegido
+                clips_acumulados.append(clip_enriquecido)
+    finally:
+        _descargar_modelo_ollama_ram(modelo_elegido, on_log=_log)
+
+    clips_finales = _deduplicar_clips_solapados(clips_acumulados)
+    if not clips_finales:
+        raise RuntimeError(
+            f"Ollama ({modelo_elegido}) no detectó momentos virales válidos en la transcripción."
+        )
+
+    for idx_f, clip_f in enumerate(clips_finales, start=1):
+        clip_f["id"] = idx_f
+
+    _guardar_y_sincronizar_clips(clips_finales, job_dir=job_dir)
+    _log(
+        f"✓ Análisis local completado ({modelo_elegido}): {len(clips_finales)} clips con word_timestamps guardados en clips.json"
+    )
+    _emitir_telemetria(
+        on_telemetria,
+        ultimo_ts,
+        {
+            "etapa": "local_ollama",
+            "titulo_etapa": f"Curaduría Viral Local ({modelo_elegido})",
+            "porcentaje": 100.0,
+            "velocidad_red": modelo_elegido,
+            "tamano_total": f"{len(clips_finales)} clips",
+            "eta": "00:00",
+            "detalle": f"Listo: {len(clips_finales)} clips seleccionados • RAM Ollama liberada",
+        },
+        forzar=True,
+    )
+    return clips_finales
 
 
 def descargar_video_fuente(
@@ -2240,6 +3419,188 @@ def _ejecutar_comando_con_captura(
     return salida_txt
 
 
+def _construir_prompt_alineacion_subtitulos(
+    duracion_clip: float,
+    subtitulos: List[SegmentoSubtitulo],
+) -> str:
+    """Construye el prompt de micro-pasada para sincronizar subtítulos exactamente al audio del clip cortado."""
+    guia_texto = " ".join(s.texto for s in subtitulos if getattr(s, "texto", "")).strip()
+    bloque_guia = (
+        f'\nGUÍA ORTOGRÁFICA OPCIONAL (únicamente como apoyo de nombres propios/jerga si realmente se pronuncian; '
+        f'PROHIBIDO copiar frases ausentes o reutilizar tiempos viejos): "{guia_texto[:600]}"'
+        if guia_texto
+        else ""
+    )
+    return (
+        f"Eres un transcriptor fonético forense experto en streaming y jerga colombiana.\n"
+        f"Sincroniza y transcribe LITERALMENTE lo que se escucha en el audio adjunto de este clip "
+        f"(duración total exacta: {duracion_clip:.2f} segundos).\n"
+        f"REGLAS ESTRICTAS:\n"
+        f"- Timestamps `inicio_rel` y `fin_rel` en segundos decimales exactos desde 0.00 hasta {duracion_clip:.2f} "
+        f"(precisión de centésimas, en orden cronológico y sin solapamientos).\n"
+        f"- Bloques dinámicos de lectura rápida de 2 a 4 palabras por segmento (máximo 22 caracteres), SIN EMOJIS.\n"
+        f"- Respeta literalmente el español coloquial colombiano pronunciado (incluyendo jerga real, sin parafrasear ni inventar).\n"
+        f"- Si un tramo tiene silencio o ruido ininteligible, omítelo.{bloque_guia}"
+    )
+
+
+def _alinear_subtitulos_con_clip_renderizado(
+    ruta_video_raw: str,
+    subtitulos: List[SegmentoSubtitulo],
+    job_dir: Path,
+    id_clip: int,
+    duracion_clip: float,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> List[SegmentoSubtitulo]:
+    """Re-sincroniza subtítulos contra el audio exacto de raw_clip_<id>.mp4 usando Gemini File API."""
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if (
+        not subtitulos
+        or duracion_clip <= 0
+        or not api_key
+        or not ruta_video_raw
+        or not Path(ruta_video_raw).is_file()
+    ):
+        return subtitulos
+
+    carpeta_job = Path(job_dir).resolve()
+    carpeta_job.mkdir(parents=True, exist_ok=True)
+    ruta_audio_clip = carpeta_job / f"clip_audio_{id_clip}.mp3"
+
+    client: Optional[genai.Client] = None
+    archivo_subido: Any = None
+    try:
+        comando_audio = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(ruta_video_raw),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "12000",
+            "-b:a",
+            "24k",
+            str(ruta_audio_clip),
+        ]
+        subprocess.run(comando_audio, check=True, capture_output=True, text=True)
+        if not ruta_audio_clip.is_file() or ruta_audio_clip.stat().st_size <= 0:
+            raise RuntimeError("El audio extraído del clip raw está vacío.")
+
+        client = genai.Client(
+            api_key=api_key,
+            http_options={"timeout": GEMINI_TIMEOUT_MS},
+        )
+        archivo_subido = _subir_archivo_gemini_activo(
+            client,
+            ruta_audio_clip,
+            on_log=on_log,
+        )
+        prompt = _construir_prompt_alineacion_subtitulos(duracion_clip, subtitulos)
+        subs_alineados, modelo_usado = _ejecutar_cascada_modelos_gemini(
+            client=client,
+            archivo_subido=archivo_subido,
+            prompt=prompt,
+            response_schema=list[SegmentoSubtitulo],
+            temperature=0.1,
+            parsear_fn=lambda txt: _parsear_subtitulos_json(txt, duracion_clip),
+            on_log=on_log,
+        )
+        _log(
+            f"✓ Subtítulos del Clip #{id_clip} alineados fonéticamente con {modelo_usado} "
+            f"({len(subs_alineados)} segmentos)"
+        )
+        return subs_alineados
+    except Exception as exc:
+        _log(
+            f"[AVISO] Falló micro-pasada de alineación fonética para Clip #{id_clip} ({exc}); "
+            "usando subtítulos originales como fallback seguro."
+        )
+        return subtitulos
+    finally:
+        if client is not None and archivo_subido is not None and getattr(archivo_subido, "name", None):
+            try:
+                client.files.delete(name=archivo_subido.name)
+            except Exception:
+                pass
+        if ruta_audio_clip.exists():
+            try:
+                os.remove(ruta_audio_clip)
+            except OSError:
+                pass
+
+
+def _construir_comando_quemar_ass(
+    ruta_video_raw: str | Path,
+    archivo_salida: Path,
+    ruta_ass: str | Path,
+    encoder: str,
+    fonts_dir: Optional[str] = None,
+) -> List[str]:
+    """Construye la segunda pasada rápida de FFmpeg sobre raw_clip con -vf subtitles y -c:a copy."""
+    comando = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        "-y",
+    ]
+    if encoder == "h264_vaapi":
+        comando.extend(["-vaapi_device", VAAPI_DEVICE])
+
+    comando.extend(["-i", str(ruta_video_raw)])
+
+    ruta_esc = _escapar_ruta_ffmpeg_filtro(ruta_ass)
+    if fonts_dir:
+        fonts_esc = _escapar_ruta_ffmpeg_filtro(fonts_dir)
+        filtro_subs = f"subtitles='{ruta_esc}':fontsdir='{fonts_esc}'"
+    else:
+        filtro_subs = f"subtitles='{ruta_esc}'"
+
+    if encoder == "h264_vaapi":
+        vf = f"{filtro_subs},format=nv12,hwupload"
+        codec_args = ["-c:v", "h264_vaapi", "-qp", "23"]
+    else:
+        vf = f"{filtro_subs},format=yuv420p"
+        codec_args = [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "22",
+            "-threads",
+            "0",
+        ]
+
+    comando.extend(
+        [
+            "-vf",
+            vf,
+            *codec_args,
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(archivo_salida),
+        ]
+    )
+    return comando
+
+
 def _preparar_archivo_ass_clip(
     subtitulos: Optional[List[Any]],
     id_clip: str | int,
@@ -2384,8 +3745,9 @@ def procesar_clip_ffmpeg(
     clip_indice: Optional[int] = None,
     total_clips: Optional[int] = None,
     on_log: Optional[Callable[[str], None]] = None,
+    alinear_subtitulos: bool = True,
 ) -> str:
-    """Extrae el clip con input seek (-ss) y corte exacto (-t), renderiza 9:16 por VAAPI/CPU, watermark adaptativa y .ass con telemetría."""
+    """Renderiza el clip 9:16 (1 pasada directa si alinear_subtitulos=False o sin subs; 2 pasos con alineación fonética si alinear_subtitulos=True)."""
     def _log(msg: str) -> None:
         if on_log is not None:
             on_log(msg)
@@ -2404,24 +3766,21 @@ def procesar_clip_ffmpeg(
     nombre_clip = f"{job_id}_clip_{id_clip}.mp4" if job_id else f"clip_{id_clip}.mp4"
     archivo_salida = CARPETA_SALIDA / nombre_clip
 
+    if job_dir:
+        carpeta_job = Path(job_dir).resolve()
+    elif job_id:
+        carpeta_job = (CARPETA_JOBS / job_id).resolve()
+    else:
+        carpeta_job = (CARPETA_JOBS / "standalone").resolve()
+    carpeta_job.mkdir(parents=True, exist_ok=True)
+
     _log(
         f"\n--- Procesando Clip {id_clip} ({inicio} -> {fin}, t={duracion_str}s) "
         f"[Salida: {nombre_clip}] ---"
     )
 
-    ruta_ass = _preparar_archivo_ass_clip(
-        subtitulos=subtitulos,
-        id_clip=id_clip,
-        duracion_clip=duracion_clip,
-        job_id=job_id,
-        job_dir=job_dir,
-    )
-    fuente_sub, fonts_dir_sub = _obtener_fuente_y_dir_subtitulos()
-    if ruta_ass:
-        _log(
-            f"✓ Subtítulos dinámicos generados en: {ruta_ass} "
-            f"[fuente={fuente_sub}, fontsdir={fonts_dir_sub or 'sistema'}]"
-        )
+    subs_norm = _normalizar_subtitulos(subtitulos, duracion_clip)
+    tiene_subs = bool(subs_norm)
 
     clave_cache = job_id or f"anon:{url_o_archivo}"
     if os.path.exists(url_o_archivo):
@@ -2439,133 +3798,271 @@ def procesar_clip_ffmpeg(
 
     y_watermark = _calcular_y_watermark(dimensiones)
     encoder_activo = detectar_encoder_hardware()
-    ruta_ass_activa = ruta_ass
     url_refrescada = False
     etiqueta_clip = f"Renderizando Clip #{id_clip}" + (
         f" ({clip_indice}/{total_clips})" if clip_indice and total_clips else ""
     )
 
-    while True:
-        comando_ffmpeg = _construir_comando_render(
-            entradas_media=entradas_media,
-            es_remoto=es_remoto,
-            inicio=inicio,
-            duracion_str=duracion_str,
-            archivo_salida=archivo_salida,
-            y_watermark=y_watermark,
-            encoder=encoder_activo,
-            ruta_ass=ruta_ass_activa,
-            fonts_dir=fonts_dir_sub if ruta_ass_activa else None,
-        )
+    def _emitir_render_tele(
+        pct: float,
+        fps: str = "--",
+        velocidad_x: str = "--",
+        eta: str = "--:--",
+        frame: int = 0,
+        out_time: str = "00:00:00",
+        detalle: str = "",
+        forzar: bool = False,
+    ) -> None:
+        if on_telemetria is None:
+            return
+        payload = {
+            "etapa": "render",
+            "titulo_etapa": etiqueta_clip,
+            "porcentaje": round(min(100.0, max(0.0, float(pct))), 1),
+            "fps": fps,
+            "velocidad_x": velocidad_x,
+            "velocidad_render": velocidad_x,
+            "eta": eta,
+            "encoder": encoder_activo,
+            "clip_id": str(id_clip),
+            "clip_indice": clip_indice,
+            "total_clips": total_clips,
+            "frame": frame,
+            "out_time": out_time,
+            "duracion_clip": duracion_clip,
+            "detalle": detalle,
+        }
+        if forzar:
+            _emitir_telemetria(on_telemetria, [0.0], payload, forzar=True)
+        else:
+            on_telemetria(payload)
+
+    def _ejecutar_paso_1(
+        destino_paso1: Path,
+        escala_pct: float = 1.0,
+        etiqueta_paso: str = "",
+        ruta_ass: Optional[str | Path] = None,
+        fonts_dir: Optional[str | Path] = None,
+    ) -> None:
+        nonlocal entradas_media, dimensiones, y_watermark, encoder_activo, url_refrescada
+        ass_actual = ruta_ass
+        fonts_actual = fonts_dir
+        while True:
+            comando_ffmpeg = _construir_comando_render(
+                entradas_media=entradas_media,
+                es_remoto=es_remoto,
+                inicio=inicio,
+                duracion_str=duracion_str,
+                archivo_salida=destino_paso1,
+                y_watermark=y_watermark,
+                encoder=encoder_activo,
+                ruta_ass=ass_actual,
+                fonts_dir=fonts_actual,
+            )
+            sufijo_paso = f" [{etiqueta_paso}]" if etiqueta_paso else ""
+            _log(
+                f"Renderizando composición 9:16 con FFmpeg{sufijo_paso} "
+                f"[encoder={encoder_activo}, wm_y={y_watermark}, subs={'directo' if ass_actual else 'no'}]..."
+            )
+            _emitir_render_tele(
+                0.0,
+                detalle=f"Iniciando render {encoder_activo}{' • ' + etiqueta_paso if etiqueta_paso else ''}...",
+                forzar=True,
+            )
+
+            def _on_prog_p1(prog: Dict[str, Any]) -> None:
+                _emitir_render_tele(
+                    prog["porcentaje"] * escala_pct,
+                    fps=prog["fps_str"],
+                    velocidad_x=prog["speed_str"],
+                    eta=prog["eta_str"],
+                    frame=prog["frame"],
+                    out_time=prog["out_time_str"],
+                    detalle=(
+                        f"Encoder {encoder_activo}"
+                        f"{' (' + etiqueta_paso + ')' if etiqueta_paso else ''} • "
+                        f"{prog['fps_str']} fps • {prog['speed_str']} • ETA {prog['eta_str']}"
+                    ),
+                )
+
+            try:
+                _ejecutar_comando_con_captura(
+                    comando_ffmpeg,
+                    duracion_objetivo=duracion_clip,
+                    on_progreso=_on_prog_p1 if on_telemetria is not None else None,
+                )
+                break
+            except subprocess.CalledProcessError as err:
+                if destino_paso1.exists():
+                    try:
+                        destino_paso1.unlink()
+                    except OSError:
+                        pass
+
+                stderr_txt = err.stderr or err.output or ""
+
+                if es_remoto and not url_refrescada and _es_error_http_expiracion(stderr_txt):
+                    _log(
+                        "[AVISO] Error HTTP 403/410 detectado en stream; "
+                        "invalidando caché y re-obteniendo URLs..."
+                    )
+                    STREAM_URL_CACHE.invalidar(clave_cache)
+                    entradas_media = obtener_urls_stream(
+                        url_o_archivo, job_id=job_id, forzar_recarga=True
+                    )
+                    dimensiones = obtener_dimensiones_video(entradas_media[0])
+                    STREAM_URL_CACHE.actualizar_dimensiones(clave_cache, url_o_archivo, dimensiones)
+                    y_watermark = _calcular_y_watermark(dimensiones)
+                    url_refrescada = True
+                    continue
+
+                if ass_actual is not None and re.search(
+                    r"Parsed_subtitles|subtitles|libass|\.ass", stderr_txt, re.IGNORECASE
+                ):
+                    _log(
+                        "[AVISO] El filtro libass falló en pasada directa; "
+                        "reintentando render limpio sin subtítulos..."
+                    )
+                    ass_actual = None
+                    fonts_actual = None
+                    continue
+
+                if encoder_activo == "h264_vaapi":
+                    _log(
+                        "[AVISO] Renderizado VAAPI falló en ejecución; "
+                        "reintentando automáticamente con CPU (libx264)..."
+                    )
+                    encoder_activo = "libx264"
+                    continue
+
+                raise
+
+    if not tiene_subs:
+        _ejecutar_paso_1(archivo_salida, escala_pct=1.0)
+        _log(f"✓ Clip {id_clip} guardado con éxito en: {archivo_salida}")
+        return str(archivo_salida.resolve())
+
+    if not alinear_subtitulos:
+        ruta_ass = generar_archivo_ass(subs_norm, carpeta_job / f"subs_{id_clip}.ass")
+        fuente_sub, fonts_dir_sub = _obtener_fuente_y_dir_subtitulos()
         _log(
-            f"Renderizando composición 9:16 con FFmpeg [encoder={encoder_activo}, "
-            f"wm_y={y_watermark}, subs={'sí' if ruta_ass_activa else 'no'}]..."
+            f"✓ Subtítulos Whisper listos para 1 pasada directa: {ruta_ass} "
+            f"[fuente={fuente_sub}, fontsdir={fonts_dir_sub or 'sistema'}]"
         )
-        _emitir_telemetria(
-            on_telemetria,
-            [0.0],
-            {
-                "etapa": "render",
-                "titulo_etapa": etiqueta_clip,
-                "porcentaje": 0.0,
-                "fps": "--",
-                "velocidad_x": "--",
-                "eta": "--:--",
-                "encoder": encoder_activo,
-                "clip_id": str(id_clip),
-                "clip_indice": clip_indice,
-                "total_clips": total_clips,
-                "frame": 0,
-                "out_time": "00:00:00",
-                "duracion_clip": duracion_clip,
-                "detalle": f"Iniciando render {encoder_activo}...",
-            },
+        _ejecutar_paso_1(
+            archivo_salida,
+            escala_pct=1.0,
+            etiqueta_paso="Pasada única 9:16 + .ass",
+            ruta_ass=ruta_ass,
+            fonts_dir=fonts_dir_sub,
+        )
+        _log(f"✓ Clip {id_clip} guardado con éxito en: {archivo_salida}")
+        return str(archivo_salida.resolve())
+
+    raw_clip = carpeta_job / f"raw_clip_{id_clip}.mp4"
+    try:
+        # Paso 1: corte y composición 9:16 limpia (sin subtítulos) hacia raw_clip_<id>.mp4
+        _ejecutar_paso_1(raw_clip, escala_pct=0.50, etiqueta_paso="Paso 1/2: corte 9:16")
+
+        # Paso 2a: micro-pasada de alineación fonética sobre el audio exacto de raw_clip
+        _emitir_render_tele(
+            52.0,
+            detalle="Alineando subtítulos fonéticamente al audio exacto...",
             forzar=True,
         )
+        id_clip_arg: Any = int(id_clip) if str(id_clip).isdigit() else id_clip
+        subs_alineados = _alinear_subtitulos_con_clip_renderizado(
+            str(raw_clip),
+            subs_norm,
+            carpeta_job,
+            id_clip_arg,
+            duracion_clip,
+            on_log=on_log,
+        )
+        subs_finales = _normalizar_subtitulos(subs_alineados, duracion_clip) or subs_norm
+        ruta_ass = generar_archivo_ass(subs_finales, carpeta_job / f"subs_{id_clip}.ass")
+        fuente_sub, fonts_dir_sub = _obtener_fuente_y_dir_subtitulos()
+        _log(
+            f"✓ Subtítulos dinámicos alineados en: {ruta_ass} "
+            f"[fuente={fuente_sub}, fontsdir={fonts_dir_sub or 'sistema'}]"
+        )
 
-        def _on_prog_ffmpeg(prog: Dict[str, Any]) -> None:
-            if on_telemetria is None:
-                return
-            on_telemetria(
-                {
-                    "etapa": "render",
-                    "titulo_etapa": etiqueta_clip,
-                    "porcentaje": prog["porcentaje"],
-                    "fps": prog["fps_str"],
-                    "velocidad_x": prog["speed_str"],
-                    "eta": prog["eta_str"],
-                    "encoder": encoder_activo,
-                    "clip_id": str(id_clip),
-                    "clip_indice": clip_indice,
-                    "total_clips": total_clips,
-                    "frame": prog["frame"],
-                    "out_time": prog["out_time_str"],
-                    "duracion_clip": duracion_clip,
-                    "detalle": (
-                        f"Encoder {encoder_activo} • {prog['fps_str']} fps • "
+        # Paso 2b: quemado rápido de subtítulos .ass sobre raw_clip con -c:a copy
+        while True:
+            comando_pass2 = _construir_comando_quemar_ass(
+                ruta_video_raw=raw_clip,
+                archivo_salida=archivo_salida,
+                ruta_ass=ruta_ass,
+                encoder=encoder_activo,
+                fonts_dir=fonts_dir_sub,
+            )
+            _log(
+                f"Quemando subtítulos .ass sobre raw_clip [Paso 2/2, encoder={encoder_activo}]..."
+            )
+            _emitir_render_tele(
+                55.0,
+                detalle=f"Paso 2/2: quemando subtítulos ({encoder_activo})...",
+                forzar=True,
+            )
+
+            def _on_prog_p2(prog: Dict[str, Any]) -> None:
+                _emitir_render_tele(
+                    55.0 + prog["porcentaje"] * 0.45,
+                    fps=prog["fps_str"],
+                    velocidad_x=prog["speed_str"],
+                    eta=prog["eta_str"],
+                    frame=prog["frame"],
+                    out_time=prog["out_time_str"],
+                    detalle=(
+                        f"Paso 2/2 ({encoder_activo}) • {prog['fps_str']} fps • "
                         f"{prog['speed_str']} • ETA {prog['eta_str']}"
                     ),
-                }
-            )
+                )
 
-        try:
-            _ejecutar_comando_con_captura(
-                comando_ffmpeg,
-                duracion_objetivo=duracion_clip,
-                on_progreso=_on_prog_ffmpeg if on_telemetria is not None else None,
-            )
-            break
-        except subprocess.CalledProcessError as err:
-            if archivo_salida.exists():
-                try:
-                    archivo_salida.unlink()
-                except OSError:
-                    pass
+            try:
+                _ejecutar_comando_con_captura(
+                    comando_pass2,
+                    duracion_objetivo=duracion_clip,
+                    on_progreso=_on_prog_p2 if on_telemetria is not None else None,
+                )
+                break
+            except subprocess.CalledProcessError as err:
+                if archivo_salida.exists():
+                    try:
+                        archivo_salida.unlink()
+                    except OSError:
+                        pass
 
-            stderr_txt = err.stderr or err.output or ""
+                stderr_txt = err.stderr or err.output or ""
 
-            if es_remoto and not url_refrescada and _es_error_http_expiracion(stderr_txt):
+                if re.search(r"Parsed_subtitles|subtitles|libass|\.ass", stderr_txt, re.IGNORECASE):
+                    _log(
+                        "[AVISO] El filtro de subtítulos .ass falló en Paso 2; "
+                        "guardando clip sin subtítulos desde raw_clip..."
+                    )
+                    shutil.copy2(raw_clip, archivo_salida)
+                    break
+
+                if encoder_activo == "h264_vaapi":
+                    _log(
+                        "[AVISO] Quemado .ass con VAAPI falló en Paso 2; "
+                        "reintentando automáticamente con CPU (libx264)..."
+                    )
+                    encoder_activo = "libx264"
+                    continue
+
                 _log(
-                    "[AVISO] Error HTTP 403/410 detectado en stream; "
-                    "invalidando caché y re-obteniendo URLs..."
+                    "[AVISO] Paso 2 falló con subtítulos activos; "
+                    "guardando clip limpio sin subtítulos desde raw_clip..."
                 )
-                STREAM_URL_CACHE.invalidar(clave_cache)
-                entradas_media = obtener_urls_stream(
-                    url_o_archivo, job_id=job_id, forzar_recarga=True
-                )
-                dimensiones = obtener_dimensiones_video(entradas_media[0])
-                STREAM_URL_CACHE.actualizar_dimensiones(clave_cache, url_o_archivo, dimensiones)
-                y_watermark = _calcular_y_watermark(dimensiones)
-                url_refrescada = True
-                continue
-
-            if ruta_ass_activa and re.search(
-                r"Parsed_subtitles|subtitles|libass|\.ass", stderr_txt, re.IGNORECASE
-            ):
-                _log(
-                    "[AVISO] El filtro de subtítulos .ass falló; "
-                    "reintentando render del clip sin subtítulos..."
-                )
-                ruta_ass_activa = None
-                continue
-
-            if encoder_activo == "h264_vaapi":
-                _log(
-                    "[AVISO] Renderizado VAAPI falló en ejecución; "
-                    "reintentando automáticamente con CPU (libx264)..."
-                )
-                encoder_activo = "libx264"
-                continue
-
-            if ruta_ass_activa:
-                _log(
-                    "[AVISO] Renderizado falló con subtítulos activos; "
-                    "reintentando sin subtítulos..."
-                )
-                ruta_ass_activa = None
-                continue
-
-            raise
+                shutil.copy2(raw_clip, archivo_salida)
+                break
+    finally:
+        if raw_clip.exists():
+            try:
+                raw_clip.unlink()
+            except OSError:
+                pass
 
     _log(f"✓ Clip {id_clip} guardado con éxito en: {archivo_salida}")
     return str(archivo_salida.resolve())
@@ -2624,7 +4121,7 @@ def _ejecutar_paso_con_telemetria(
     on_telemetria_externa: Optional[Callable[[Dict[str, Any]], None]] = None,
     **kwargs: Any,
 ) -> Generator[Dict[str, Any], None, Any]:
-    """Ejecuta una etapa bloqueante en hilo worker re-emitiendo su telemetría en vivo por el generador."""
+    """Ejecuta una etapa bloqueante en hilo worker re-emitiendo su telemetría en vivo con cancelación Ctrl+C inmediata."""
     cola: queue.Queue[Tuple[str, Any]] = queue.Queue()
     acepta_tele = _acepta_kwarg(fn, "on_telemetria")
 
@@ -2650,7 +4147,15 @@ def _ejecutar_paso_con_telemetria(
     hilo = threading.Thread(target=_worker, daemon=True)
     hilo.start()
     while True:
-        tipo, payload = cola.get()
+        try:
+            tipo, payload = cola.get(timeout=0.5)
+        except queue.Empty:
+            if not hilo.is_alive() and cola.empty():
+                raise RuntimeError(
+                    f"El hilo worker de '{getattr(fn, '__name__', 'etapa')}' finalizó sin resultado."
+                )
+            continue
+
         if tipo == "tele":
             yield construir_estado(payload)
         elif tipo == "ok":
@@ -2672,13 +4177,17 @@ def _orquestar_render_y_subida(
     intervalo_horas: int | float = 0,
     on_log: Optional[Callable[[str], None]] = None,
     on_telemetria: Optional[Callable[[Dict[str, Any]], None]] = None,
+    alinear_subtitulos: bool = True,
 ) -> Generator[Dict[str, Any], None, None]:
-    """Orquestador compartido de Fase 3+4 con tolerancia a fallos por clip, telemetría en vivo y control de cuota."""
+    """Orquestador compartido de Fase 3+4 con renderizado paralelo (max_workers=2) y locks thread-safe."""
+    log_lock = threading.Lock()
+
     def _log(msg: str) -> None:
-        if on_log is not None:
-            on_log(msg)
-        else:
-            print(msg)
+        with log_lock:
+            if on_log is not None:
+                on_log(msg)
+            else:
+                print(msg)
 
     job_dir_str = str(Path(job_dir).resolve()) if job_dir else None
     fuente_local: Optional[str] = None
@@ -2708,8 +4217,16 @@ def _orquestar_render_y_subida(
     )
 
     try:
+        es_archivo_local = False
+        try:
+            es_archivo_local = bool(str(url or "").strip()) and Path(url).is_file()
+        except OSError:
+            es_archivo_local = False
+
         # Para videos <= 1h descargar una sola vez evita múltiples conexiones HTTP/HLS lentas
-        if duracion_total is None or duracion_total <= 3600:
+        if es_archivo_local:
+            _log(f"✓ Usando archivo multimedia local directo para render: {url}")
+        elif duracion_total is None or duracion_total <= 3600:
             try:
                 destino_fuente = (
                     Path(job_dir) / "temp_source.mp4"
@@ -2753,21 +4270,80 @@ def _orquestar_render_y_subida(
 
         entrada_render = fuente_local or url
         total_clips = len(clips)
-        subidos_en_lote = 0
+        if total_clips == 0:
+            return
 
-        for idx, clip in enumerate(clips, start=1):
+        subidos_en_lote = 0
+        state_lock = threading.Lock()
+        yt_lock = threading.Lock()
+        cola_estados: queue.Queue[Tuple[str, Dict[str, Any]]] = queue.Queue()
+        progreso_clip: Dict[int, float] = {idx: 0.0 for idx in range(1, total_clips + 1)}
+        clips_activos_map: Dict[int, Dict[str, Any]] = {}
+        acepta_clip_idx = _acepta_kwarg(procesar_clip_ffmpeg, "clip_indice")
+        acepta_total_clips = _acepta_kwarg(procesar_clip_ffmpeg, "total_clips")
+        acepta_on_log = _acepta_kwarg(procesar_clip_ffmpeg, "on_log")
+        acepta_on_tele = _acepta_kwarg(procesar_clip_ffmpeg, "on_telemetria")
+        acepta_alinear_subs = _acepta_kwarg(procesar_clip_ffmpeg, "alinear_subtitulos")
+
+        def _emitir_en_cola_seguro(
+            fase: str,
+            mensaje: str,
+            tele_payload: Dict[str, Any],
+            progreso_override: Optional[float] = None,
+        ) -> None:
+            with state_lock:
+                activos_snapshot = [dict(clips_activos_map[k]) for k in sorted(clips_activos_map)]
+                tele_envio = dict(tele_payload)
+                tele_envio["clips_activos"] = activos_snapshot
+                if progreso_override is not None:
+                    prog_global = progreso_override
+                else:
+                    prog_global = min(
+                        0.95,
+                        0.60 + 0.35 * (sum(progreso_clip.values()) / max(1, total_clips)),
+                    )
+                if on_telemetria is not None:
+                    try:
+                        on_telemetria(dict(tele_envio))
+                    except Exception:
+                        pass
+                estado = _emitir_estado(
+                    fase=fase,
+                    progreso=prog_global,
+                    mensaje=mensaje,
+                    clips=[dict(c) for c in clips],
+                    ultimo_video=ultimo_video,
+                    job_dir=job_dir_str,
+                    telemetria=tele_envio,
+                )
+            cola_estados.put(("estado", estado))
+
+        def _procesar_un_clip(idx: int, clip: dict) -> None:
+            nonlocal ultimo_video, subidos_en_lote
             cid = clip.get("id", idx)
-            frac_inicio = 0.60 + (0.35 * (idx - 1) / max(1, total_clips))
-            frac_span = 0.35 / max(1, total_clips)
+            c_tit = clip.get("titulo", "")
             _log(
                 f"Procesando Clip #{cid}/{total_clips} ({clip.get('inicio')} -> {clip.get('fin')})..."
             )
+            with state_lock:
+                clips_activos_map[idx] = {
+                    "clip_id": str(cid),
+                    "clip_indice": idx,
+                    "estado": "renderizando",
+                    "porcentaje": 0.0,
+                    "encoder": "detectando...",
+                    "fps": "--",
+                    "velocidad_x": "--",
+                    "velocidad_render": "--",
+                }
+
             tele_render_init = {
                 "etapa": "render",
                 "titulo_etapa": f"Renderizando Clip #{cid} ({idx}/{total_clips})",
                 "porcentaje": 0.0,
                 "fps": "--",
                 "velocidad_x": "--",
+                "velocidad_render": "--",
                 "eta": "--:--",
                 "encoder": "detectando...",
                 "clip_id": str(cid),
@@ -2775,17 +4351,39 @@ def _orquestar_render_y_subida(
                 "total_clips": total_clips,
                 "detalle": f"Preparando composición 9:16 del Clip #{cid}",
             }
-            if on_telemetria is not None:
-                on_telemetria(dict(tele_render_init))
-            yield _emitir_estado(
+            _emitir_en_cola_seguro(
                 fase="render",
-                progreso=frac_inicio,
-                mensaje=f"Renderizando Clip #{cid}/{total_clips}: {clip.get('titulo', '')}",
-                clips=clips,
-                ultimo_video=ultimo_video,
-                job_dir=job_dir_str,
-                telemetria=tele_render_init,
+                mensaje=f"Renderizando Clip #{cid}/{total_clips}: {c_tit}",
+                tele_payload=tele_render_init,
             )
+
+            def _on_tele_clip(datos: Dict[str, Any]) -> None:
+                copia = dict(datos or {})
+                pct_clip = float(copia.get("porcentaje", 0.0))
+                vel_clip = str(copia.get("velocidad_x") or copia.get("velocidad_render") or "--")
+                with state_lock:
+                    progreso_clip[idx] = max(
+                        progreso_clip.get(idx, 0.0),
+                        min(1.0, max(0.0, pct_clip / 100.0)),
+                    )
+                    clips_activos_map[idx] = {
+                        "clip_id": str(copia.get("clip_id") or cid),
+                        "clip_indice": idx,
+                        "estado": "renderizando",
+                        "porcentaje": round(pct_clip, 1),
+                        "encoder": str(copia.get("encoder") or ""),
+                        "fps": str(copia.get("fps") or "--"),
+                        "velocidad_x": vel_clip,
+                        "velocidad_render": vel_clip,
+                    }
+                _emitir_en_cola_seguro(
+                    fase="render",
+                    mensaje=(
+                        f"Renderizando Clip #{cid}/{total_clips}: {c_tit} "
+                        f"[{pct_clip:.1f}% • {copia.get('encoder', '')}]"
+                    ),
+                    tele_payload=copia,
+                )
 
             try:
                 kwargs_render: Dict[str, Any] = {
@@ -2793,122 +4391,168 @@ def _orquestar_render_y_subida(
                     "subtitulos": clip.get("subtitulos"),
                     "job_dir": job_dir,
                 }
-                if _acepta_kwarg(procesar_clip_ffmpeg, "clip_indice"):
+                if acepta_clip_idx:
                     kwargs_render["clip_indice"] = idx
-                if _acepta_kwarg(procesar_clip_ffmpeg, "total_clips"):
+                if acepta_total_clips:
                     kwargs_render["total_clips"] = total_clips
-                if _acepta_kwarg(procesar_clip_ffmpeg, "on_log"):
+                if acepta_on_log:
                     kwargs_render["on_log"] = _log
+                if acepta_on_tele:
+                    kwargs_render["on_telemetria"] = _on_tele_clip
+                if acepta_alinear_subs:
+                    kwargs_render["alinear_subtitulos"] = (
+                        bool(alinear_subtitulos)
+                        and clip.get("subtitulos_origen") != "whisper_word_timestamps"
+                    )
 
-                salida = yield from _ejecutar_paso_con_telemetria(
-                    procesar_clip_ffmpeg,
+                salida = procesar_clip_ffmpeg(
                     entrada_render,
                     clip.get("inicio"),
                     clip.get("fin"),
                     str(cid),
-                    construir_estado=lambda tele, fi=frac_inicio, fs=frac_span, c_id=cid, t_c=total_clips, c_tit=clip.get("titulo", ""): _emitir_estado(
-                        fase="render",
-                        progreso=min(0.95, fi + fs * (float(tele.get("porcentaje", 0.0)) / 100.0)),
-                        mensaje=(
-                            f"Renderizando Clip #{c_id}/{t_c}: {c_tit} "
-                            f"[{tele.get('porcentaje', 0):.1f}% • {tele.get('encoder', '')}]"
-                        ),
-                        clips=clips,
-                        ultimo_video=ultimo_video,
-                        job_dir=job_dir_str,
-                        telemetria=tele,
-                    ),
-                    on_telemetria_externa=on_telemetria,
                     **kwargs_render,
                 )
-                clip["archivo_local"] = salida
-                clip["render_status"] = "OK"
-                ultimo_video = salida
+                with state_lock:
+                    clip["archivo_local"] = salida
+                    clip["render_status"] = "OK"
+                    ultimo_video = salida
+                    progreso_clip[idx] = 1.0
                 _log(f"✓ Clip #{cid} renderizado en: {salida}")
 
                 if not subir_youtube:
-                    clip["youtube_status"] = "Subida omitida (--sin-subida)"
+                    with state_lock:
+                        clip["youtube_status"] = "Subida omitida (--sin-subida)"
                 elif youtube_client is None:
-                    clip["youtube_status"] = "Pendiente de subida (Sin credenciales activas)"
+                    with state_lock:
+                        clip["youtube_status"] = "Pendiente de subida (Sin credenciales activas)"
                 else:
-                    cuota = verificar_cuota_diaria(limite_diario=LIMITE_CUOTA_DIARIA_SHORTS)
-                    if not cuota["permitido"]:
-                        clip["youtube_status"] = (
-                            f"Pendiente por cuota diaria ({cuota['limite']}/24h)"
-                        )
-                        _log(
-                            f"[AVISO] Cuota diaria alcanzada ({cuota['subidas_24h']}/{cuota['limite']} "
-                            f"en últimas 24h). Clip #{cid} marcado como '{clip['youtube_status']}'."
-                        )
-                    else:
-                        publish_at_clip = None
-                        if publish_at_inicio and str(publish_at_inicio).strip():
-                            publish_at_clip = calcular_publish_at_utc(
-                                publish_at_inicio,
-                                indice_clip=subidos_en_lote,
-                                intervalo_horas=intervalo_horas,
+                    with yt_lock:
+                        cuota = verificar_cuota_diaria(limite_diario=LIMITE_CUOTA_DIARIA_SHORTS)
+                        if not cuota["permitido"]:
+                            with state_lock:
+                                clip["youtube_status"] = (
+                                    f"Pendiente por cuota diaria ({cuota['limite']}/24h)"
+                                )
+                            _log(
+                                f"[AVISO] Cuota diaria alcanzada ({cuota['subidas_24h']}/{cuota['limite']} "
+                                f"en últimas 24h). Clip #{cid} marcado como '{clip['youtube_status']}'."
                             )
-
-                        msg_yt = f"Subiendo Clip #{cid} a YouTube Shorts"
-                        if publish_at_clip:
-                            msg_yt += f" (Programado UTC: {publish_at_clip})"
                         else:
-                            msg_yt += " (Privado)"
-                        _log(msg_yt)
-                        tele_yt = {
-                            "etapa": "youtube",
-                            "titulo_etapa": f"Subiendo Clip #{cid} a YouTube Shorts",
-                            "porcentaje": round((idx / max(1, total_clips)) * 100.0, 1),
-                            "eta": "--:--",
-                            "clip_id": str(cid),
-                            "clip_indice": idx,
-                            "total_clips": total_clips,
-                            "detalle": msg_yt,
-                        }
-                        if on_telemetria is not None:
-                            on_telemetria(dict(tele_yt))
-                        yield _emitir_estado(
-                            fase="youtube",
-                            progreso=min(0.98, frac_inicio + (0.15 / max(1, total_clips))),
-                            mensaje=msg_yt,
-                            clips=clips,
-                            ultimo_video=ultimo_video,
-                            job_dir=job_dir_str,
-                            telemetria=tele_yt,
-                        )
+                            publish_at_clip = None
+                            if publish_at_inicio and str(publish_at_inicio).strip():
+                                publish_at_clip = calcular_publish_at_utc(
+                                    publish_at_inicio,
+                                    indice_clip=subidos_en_lote,
+                                    intervalo_horas=intervalo_horas,
+                                )
 
-                        try:
-                            info_yt = subir_short(
-                                youtube=youtube_client,
-                                ruta_video=salida,
-                                titulo=clip.get("titulo", f"Clip {cid}"),
-                                descripcion=clip.get("descripcion", ""),
-                                etiquetas=clip.get("etiquetas", []),
-                                privacidad="private",
-                                clip_id=clip.get("id"),
-                                guardar_registro=True,
-                                publish_at=publish_at_clip,
-                                on_log=_log,
-                            )
-                            clip["youtube_id"] = info_yt["youtube_id"]
-                            clip["youtube_url"] = info_yt["url"]
-                            if info_yt.get("publish_at"):
-                                clip["youtube_publish_at"] = info_yt["publish_at"]
-                                clip["youtube_status"] = f"Programado ({info_yt['publish_at']})"
+                            msg_yt = f"Subiendo Clip #{cid} a YouTube Shorts"
+                            if publish_at_clip:
+                                msg_yt += f" (Programado UTC: {publish_at_clip})"
                             else:
-                                clip["youtube_status"] = "Subido (Privado)"
-                            subidos_en_lote += 1
-                        except Exception as e_yt:
-                            _log(f"[AVISO] Error al subir Clip #{cid} a YouTube: {e_yt}")
-                            clip["youtube_status"] = f"Error subida ({str(e_yt)[:80]})"
+                                msg_yt += " (Privado)"
+                            _log(msg_yt)
+
+                            with state_lock:
+                                clips_activos_map[idx] = {
+                                    "clip_id": str(cid),
+                                    "clip_indice": idx,
+                                    "estado": "subiendo_youtube",
+                                    "porcentaje": 100.0,
+                                    "encoder": "youtube_api",
+                                    "fps": "--",
+                                    "velocidad_x": "--",
+                                }
+                                prog_actual = min(
+                                    0.98,
+                                    0.60
+                                    + 0.35 * (sum(progreso_clip.values()) / max(1, total_clips))
+                                    + (0.15 / max(1, total_clips)),
+                                )
+
+                            tele_yt = {
+                                "etapa": "youtube",
+                                "titulo_etapa": f"Subiendo Clip #{cid} a YouTube Shorts",
+                                "porcentaje": round((idx / max(1, total_clips)) * 100.0, 1),
+                                "eta": "--:--",
+                                "clip_id": str(cid),
+                                "clip_indice": idx,
+                                "total_clips": total_clips,
+                                "detalle": msg_yt,
+                            }
+                            _emitir_en_cola_seguro(
+                                fase="youtube",
+                                mensaje=msg_yt,
+                                tele_payload=tele_yt,
+                                progreso_override=prog_actual,
+                            )
+
+                            try:
+                                info_yt = subir_short(
+                                    youtube=youtube_client,
+                                    ruta_video=salida,
+                                    titulo=clip.get("titulo", f"Clip {cid}"),
+                                    descripcion=clip.get("descripcion", ""),
+                                    etiquetas=clip.get("etiquetas", []),
+                                    privacidad="private",
+                                    clip_id=clip.get("id"),
+                                    guardar_registro=True,
+                                    publish_at=publish_at_clip,
+                                    on_log=_log,
+                                )
+                                with state_lock:
+                                    clip["youtube_id"] = info_yt["youtube_id"]
+                                    clip["youtube_url"] = info_yt["url"]
+                                    if info_yt.get("publish_at"):
+                                        clip["youtube_publish_at"] = info_yt["publish_at"]
+                                        clip["youtube_status"] = f"Programado ({info_yt['publish_at']})"
+                                    else:
+                                        clip["youtube_status"] = "Subido (Privado)"
+                                subidos_en_lote += 1
+                            except Exception as e_yt:
+                                _log(f"[AVISO] Error al subir Clip #{cid} a YouTube: {e_yt}")
+                                with state_lock:
+                                    clip["youtube_status"] = f"Error subida ({str(e_yt)[:80]})"
             except Exception as e_clip:
                 err_txt = str(e_clip)
-                clip["render_status"] = f"Error render ({err_txt[:120]})"
-                clip["youtube_status"] = f"No renderizado ({err_txt[:80]})"
+                with state_lock:
+                    clip["render_status"] = f"Error render ({err_txt[:120]})"
+                    clip["youtube_status"] = f"No renderizado ({err_txt[:80]})"
+                    progreso_clip[idx] = 1.0
                 _log(f"[ERROR] Falló procesamiento del Clip #{cid}: {err_txt}")
             finally:
-                # Persistencia incremental tras cada clip sin abortar el lote
-                _guardar_y_sincronizar_clips(clips, job_dir=job_dir)
+                # Persistencia incremental thread-safe tras cada clip sin abortar el lote
+                with state_lock:
+                    clips_activos_map.pop(idx, None)
+                    _guardar_y_sincronizar_clips(clips, job_dir=job_dir)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        try:
+            futuros = [
+                executor.submit(_procesar_un_clip, idx, clip)
+                for idx, clip in enumerate(clips, start=1)
+            ]
+            while True:
+                try:
+                    tipo, payload = cola_estados.get(timeout=0.5)
+                    if tipo == "estado":
+                        yield payload
+                except queue.Empty:
+                    if all(f.done() for f in futuros) and cola_estados.empty():
+                        break
+
+            while not cola_estados.empty():
+                tipo, payload = cola_estados.get_nowait()
+                if tipo == "estado":
+                    yield payload
+
+            for fut in futuros:
+                fut.result()
+        except BaseException:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
     finally:
         if job_id:
             STREAM_URL_CACHE.invalidar(job_id)
@@ -2917,6 +4561,38 @@ def _orquestar_render_y_subida(
                 os.remove(fuente_local)
             except OSError:
                 pass
+
+
+def _limpiar_jobs_antiguos(
+    dias_retencion: int = 7,
+    job_dir_actual: Optional[Path] = None,
+) -> int:
+    """Elimina de CARPETA_JOBS los subdirectorios cuya st_mtime supere dias_retencion días (ignorando job_dir_actual)."""
+    if not CARPETA_JOBS.exists() or not CARPETA_JOBS.is_dir():
+        return 0
+
+    actual_resuelto = Path(job_dir_actual).resolve() if job_dir_actual is not None else None
+    limite_ts = time.time() - (max(0.0, float(dias_retencion)) * 86400.0)
+    eliminados = 0
+
+    try:
+        entradas = list(CARPETA_JOBS.iterdir())
+    except OSError:
+        return 0
+
+    for entrada in entradas:
+        try:
+            if not entrada.is_dir() or entrada.is_symlink():
+                continue
+            if actual_resuelto is not None and entrada.resolve() == actual_resuelto:
+                continue
+            if entrada.stat().st_mtime < limite_ts:
+                shutil.rmtree(entrada, ignore_errors=True)
+                eliminados += 1
+        except OSError:
+            continue
+
+    return eliminados
 
 
 def ejecutar_pipeline_completo(
@@ -2928,8 +4604,11 @@ def ejecutar_pipeline_completo(
     intervalo_horas: int | float = 0,
     on_log: Optional[Callable[[str], None]] = None,
     on_telemetria: Optional[Callable[[Dict[str, Any]], None]] = None,
+    motor_ia: str = "gemini",
+    modelo_local: Optional[str] = None,
+    respaldo_local_auto: bool = True,
 ) -> Generator[Dict[str, Any], None, None]:
-    """Orquestador único (CLI y GUI) que ejecuta el pipeline completo y emite diccionarios de estado con telemetría."""
+    """Orquestador único (CLI y GUI) que ejecuta el pipeline híbrido (Gemini/Local) con telemetría."""
     def _log(msg: str) -> None:
         if on_log is not None:
             on_log(msg)
@@ -2943,7 +4622,11 @@ def ejecutar_pipeline_completo(
         yield _emitir_estado("error", 0.0, msg, error=msg)
         return
 
-    if not os.environ.get("GEMINI_API_KEY"):
+    motor_normalizado = str(motor_ia or "gemini").strip().lower()
+    if motor_normalizado not in ("gemini", "local"):
+        motor_normalizado = "gemini"
+
+    if motor_normalizado != "local" and not os.environ.get("GEMINI_API_KEY"):
         msg = "Falta GEMINI_API_KEY en el archivo .env o en las variables de entorno."
         _log(f"[ERROR] {msg}")
         yield _emitir_estado("error", 0.0, msg, error=msg)
@@ -2963,6 +4646,15 @@ def ejecutar_pipeline_completo(
             return
 
     ctx = crear_contexto_job(url_limpia)
+    try:
+        eliminados = _limpiar_jobs_antiguos(dias_retencion=7, job_dir_actual=ctx.job_dir)
+        if eliminados:
+            _log(
+                f"Limpieza automática: {eliminados} carpeta(s) antigua(s) (>7 días) "
+                f"eliminada(s) de {CARPETA_JOBS}"
+            )
+    except Exception:
+        pass
     job_dir_str = str(ctx.job_dir)
     _log(f"Iniciando Job {ctx.job_id} en {ctx.job_dir}")
 
@@ -3017,49 +4709,124 @@ def ejecutar_pipeline_completo(
         dur_str = segundos_a_hhmmss(duracion) if duracion else "Desconocida"
         _log(f"✓ Audio extraído correctamente ({audio_temp}) | Duración: {dur_str}")
 
-        modelo_label = (modelo_preferido or MODELOS_CANDIDATOS[0]).strip()
-        tele_gemini_init = {
-            "etapa": "gemini",
-            "titulo_etapa": f"Analizando Narrativa Viral ({modelo_label})",
-            "porcentaje": 0.0,
-            "bloque_actual": 1,
-            "total_bloques": 1,
-            "modelo_ia": modelo_label,
-            "eta": "--:--",
-            "detalle": "Iniciando análisis de momentos virales...",
-        }
-        if on_telemetria is not None:
-            on_telemetria(dict(tele_gemini_init))
-        yield _emitir_estado(
-            fase="gemini",
-            progreso=0.30,
-            mensaje=f"Fase 2/4: Analizando narrativa viral con {modelo_label}...",
-            clips=clips,
-            ultimo_video=ultimo_video,
-            job_dir=job_dir_str,
-            telemetria=tele_gemini_init,
-        )
-        clips = yield from _ejecutar_paso_con_telemetria(
-            analizar_con_gemini,
-            audio_temp,
-            construir_estado=lambda tele: _emitir_estado(
-                fase="gemini",
-                progreso=0.30 + 0.24 * (float(tele.get("porcentaje", 0.0)) / 100.0),
-                mensaje=(
-                    f"Fase 2/4: {tele.get('titulo_etapa', 'Análisis Gemini')} "
-                    f"[{tele.get('detalle', '')}]"
-                ),
+        modelo_local_efectivo = _normalizar_modelo_ollama(modelo_local)
+        motor_efectivo = motor_normalizado
+
+        def _correr_analisis_local(modelo_loc: str) -> Generator[Dict[str, Any], None, List[dict]]:
+            tele_local_init = {
+                "etapa": "local_whisper",
+                "titulo_etapa": "Transcripción Local (Whisper Medium)",
+                "porcentaje": 0.0,
+                "velocidad_red": "CPU int8",
+                "tamano_total": "--",
+                "eta": "--:--",
+                "modelo_ia": modelo_loc,
+                "detalle": f"Preparando análisis 100% offline (Whisper + {modelo_loc})...",
+            }
+            if on_telemetria is not None:
+                on_telemetria(dict(tele_local_init))
+            yield _emitir_estado(
+                fase="local_whisper",
+                progreso=0.30,
+                mensaje=f"Fase 2/4: Transcribiendo offline con Whisper + {modelo_loc}...",
                 clips=clips,
                 ultimo_video=ultimo_video,
                 job_dir=job_dir_str,
-                telemetria=tele,
-            ),
-            on_telemetria_externa=on_telemetria,
-            duracion_total=duracion,
-            modelo_preferido=modelo_preferido,
-            job_dir=ctx.job_dir,
-            on_log=_log,
-        )
+                telemetria=tele_local_init,
+            )
+            kwargs_local: Dict[str, Any] = {}
+            if _acepta_kwarg(analizar_con_ollama, "modelo_local"):
+                kwargs_local["modelo_local"] = modelo_loc
+            if _acepta_kwarg(analizar_con_ollama, "duracion_total"):
+                kwargs_local["duracion_total"] = duracion
+            if _acepta_kwarg(analizar_con_ollama, "job_dir"):
+                kwargs_local["job_dir"] = ctx.job_dir
+            if _acepta_kwarg(analizar_con_ollama, "on_log"):
+                kwargs_local["on_log"] = _log
+            res_local = yield from _ejecutar_paso_con_telemetria(
+                analizar_con_ollama,
+                audio_temp,
+                construir_estado=lambda tele: _emitir_estado(
+                    fase=str(tele.get("etapa") or "local_ollama"),
+                    progreso=0.30 + 0.24 * (float(tele.get("porcentaje", 0.0)) / 100.0),
+                    mensaje=(
+                        f"Fase 2/4: {tele.get('titulo_etapa', 'Análisis Local')} "
+                        f"[{tele.get('detalle', '')}]"
+                    ),
+                    clips=clips,
+                    ultimo_video=ultimo_video,
+                    job_dir=job_dir_str,
+                    telemetria=tele,
+                ),
+                on_telemetria_externa=on_telemetria,
+                **kwargs_local,
+            )
+            return res_local
+
+        if motor_normalizado == "local":
+            clips = yield from _correr_analisis_local(modelo_local_efectivo)
+        else:
+            modelo_label = (modelo_preferido or MODELOS_CANDIDATOS[0]).strip()
+            tele_gemini_init = {
+                "etapa": "gemini",
+                "titulo_etapa": f"Analizando Narrativa Viral ({modelo_label})",
+                "porcentaje": 0.0,
+                "bloque_actual": 1,
+                "bloques_completados": 0,
+                "total_bloques": 1,
+                "bloques_activos": [],
+                "modelo_ia": modelo_label,
+                "eta": "--:--",
+                "detalle": "Iniciando análisis de momentos virales...",
+            }
+            if on_telemetria is not None:
+                on_telemetria(dict(tele_gemini_init))
+            yield _emitir_estado(
+                fase="gemini",
+                progreso=0.30,
+                mensaje=f"Fase 2/4: Analizando narrativa viral con {modelo_label}...",
+                clips=clips,
+                ultimo_video=ultimo_video,
+                job_dir=job_dir_str,
+                telemetria=tele_gemini_init,
+            )
+            try:
+                clips = yield from _ejecutar_paso_con_telemetria(
+                    analizar_con_gemini,
+                    audio_temp,
+                    construir_estado=lambda tele: _emitir_estado(
+                        fase="gemini",
+                        progreso=0.30 + 0.24 * (float(tele.get("porcentaje", 0.0)) / 100.0),
+                        mensaje=(
+                            f"Fase 2/4: {tele.get('titulo_etapa', 'Análisis Gemini')} "
+                            f"[{tele.get('detalle', '')}]"
+                        ),
+                        clips=clips,
+                        ultimo_video=ultimo_video,
+                        job_dir=job_dir_str,
+                        telemetria=tele,
+                    ),
+                    on_telemetria_externa=on_telemetria,
+                    duracion_total=duracion,
+                    modelo_preferido=modelo_preferido,
+                    job_dir=ctx.job_dir,
+                    on_log=_log,
+                )
+            except Exception as err_gem:
+                es_cuota_429 = isinstance(err_gem, GeminiQuotaExhaustedError) or (
+                    "429" in str(err_gem)
+                    or "RESOURCE_EXHAUSTED" in str(err_gem).upper()
+                )
+                if respaldo_local_auto and es_cuota_429:
+                    _log(
+                        f"[RESPALDO LOCAL] Cuotas Gemini 429 agotadas ({err_gem}); "
+                        f"conmutando automáticamente a motor local (Whisper + {modelo_local_efectivo})..."
+                    )
+                    motor_efectivo = "local"
+                    clips = yield from _correr_analisis_local(modelo_local_efectivo)
+                else:
+                    raise
+
         for c in clips:
             _log(
                 f"  • Clip #{c['id']}: {c['titulo']} [{c['inicio']} -> {c['fin']}] | "
@@ -3091,18 +4858,22 @@ def ejecutar_pipeline_completo(
             )
             return
 
-        for estado_lote in _orquestar_render_y_subida(
-            url=url_limpia,
-            clips=clips,
-            duracion_total=duracion,
-            subir_youtube=subir_youtube,
-            job_id=ctx.job_id,
-            job_dir=ctx.job_dir,
-            publish_at_inicio=publish_at_inicio,
-            intervalo_horas=intervalo_horas,
-            on_log=_log,
-            on_telemetria=on_telemetria,
-        ):
+        kwargs_orq: Dict[str, Any] = {
+            "url": url_limpia,
+            "clips": clips,
+            "duracion_total": duracion,
+            "subir_youtube": subir_youtube,
+            "job_id": ctx.job_id,
+            "job_dir": ctx.job_dir,
+            "publish_at_inicio": publish_at_inicio,
+            "intervalo_horas": intervalo_horas,
+            "on_log": _log,
+            "on_telemetria": on_telemetria,
+        }
+        if _acepta_kwarg(_orquestar_render_y_subida, "alinear_subtitulos"):
+            kwargs_orq["alinear_subtitulos"] = motor_efectivo != "local"
+
+        for estado_lote in _orquestar_render_y_subida(**kwargs_orq):
             if estado_lote.get("ultimo_video"):
                 ultimo_video = estado_lote["ultimo_video"]
             yield estado_lote
@@ -3227,6 +4998,14 @@ def _formatear_barra_cli(estado: Dict[str, Any], ancho_barra: int = 24) -> str:
         tam = tele.get("tamano_total") or "--"
         eta = tele.get("eta") or "--:--"
         partes.extend([f"↓ {vel}", str(tam), f"ETA {eta}"])
+    elif etapa == "local_whisper":
+        vel = tele.get("velocidad_red") or "CPU int8"
+        tam = tele.get("tamano_total") or "--"
+        partes.extend([f"Whisper ({vel})", str(tam)])
+    elif etapa == "local_ollama":
+        modelo = tele.get("modelo_ia") or tele.get("velocidad_red") or MODELOS_LOCALES_OLLAMA[0]
+        tam = tele.get("tamano_total") or "--"
+        partes.extend([f"Ollama {modelo}", str(tam)])
     elif etapa == "gemini":
         modelo = tele.get("modelo_ia") or "Gemini"
         b_act = tele.get("bloque_actual")
@@ -3237,7 +5016,7 @@ def _formatear_barra_cli(estado: Dict[str, Any], ancho_barra: int = 24) -> str:
     elif etapa == "render":
         encoder = tele.get("encoder") or "ffmpeg"
         fps = tele.get("fps") or "--"
-        vel_x = tele.get("velocidad_x") or "--"
+        vel_x = tele.get("velocidad_x") or tele.get("velocidad_render") or "--"
         eta = tele.get("eta") or "--:--"
         partes.extend([str(encoder), f"{fps} fps", str(vel_x), f"ETA {eta}"])
     elif etapa == "youtube":
@@ -3302,9 +5081,9 @@ class RenderizadorProgresoCLI:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Pipeline de automatización de clips virales Kicksazos"
+        description="Pipeline híbrido v4.1 de clips virales Kicksazos (Gemini Cloud o 100% Local)"
     )
-    parser.add_argument("url", help="URL del video o stream fuente")
+    parser.add_argument("url", help="URL del stream/VOD o ruta a un archivo de video local")
     parser.add_argument(
         "--solo-analisis",
         action="store_true",
@@ -3316,9 +5095,25 @@ def main():
         help="Renderiza los clips localmente sin subirlos a YouTube",
     )
     parser.add_argument(
+        "--motor",
+        choices=["gemini", "local"],
+        default="gemini",
+        help="Motor de análisis viral: 'gemini' (nube) o 'local' (Whisper + Ollama 100%% offline)",
+    )
+    parser.add_argument(
         "--modelo",
         default=None,
-        help="Modelo Gemini preferido para iniciar la cascada de inferencia",
+        help="Modelo Gemini preferido para iniciar la cascada de inferencia en modo nube",
+    )
+    parser.add_argument(
+        "--modelo-local",
+        default=None,
+        help=f"Modelo Ollama para análisis local (ej: {', '.join(MODELOS_LOCALES_OLLAMA)})",
+    )
+    parser.add_argument(
+        "--sin-respaldo-local",
+        action="store_true",
+        help="Desactiva el cambio automático a motor local si Gemini agota todas sus cuotas 429",
     )
     parser.add_argument(
         "--publish-at",
@@ -3344,6 +5139,9 @@ def main():
             publish_at_inicio=args.publish_at,
             intervalo_horas=args.intervalo_horas,
             on_log=cli_ui.log,
+            motor_ia=args.motor,
+            modelo_local=args.modelo_local,
+            respaldo_local_auto=not args.sin_respaldo_local,
         ):
             ultimo_estado = estado
             cli_ui.actualizar(estado)
