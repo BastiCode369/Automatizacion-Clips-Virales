@@ -9,6 +9,7 @@ load_dotenv(BASE_DIR / ".env")
 
 import argparse
 import array
+import atexit
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
 import gc
@@ -21,12 +22,14 @@ import queue
 import random
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from typing import Any, Callable, Dict, Generator, List, NamedTuple, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Generator, List, NamedTuple, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 import urllib.error
 import urllib.request
@@ -133,6 +136,177 @@ class StreamUrlCache:
 
 
 STREAM_URL_CACHE = StreamUrlCache()
+_STREAM_FETCH_LOCK = threading.Lock()
+_STREAM_FETCH_LOCKS: Dict[str, threading.Lock] = {}
+
+_CLIPS_JSON_LOCK = threading.RLock()
+_PROCESOS_ACTIVOS_LOCK = threading.Lock()
+_PROCESOS_ACTIVOS: Dict[int, Any] = {}
+
+
+def _obtener_lock_stream_job(clave_cache: str) -> threading.Lock:
+    """Devuelve un Lock por job_id para evitar llamadas yt-dlp -g duplicadas en paralelo."""
+    with _STREAM_FETCH_LOCK:
+        lock = _STREAM_FETCH_LOCKS.get(clave_cache)
+        if lock is None:
+            lock = threading.Lock()
+            _STREAM_FETCH_LOCKS[clave_cache] = lock
+        return lock
+
+
+def _escribir_json_atomico(ruta: Path, datos: Any) -> None:
+    """Escribe JSON de forma atómica usando archivo temporal y os.replace()."""
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".tmp_{ruta.stem}_", suffix=".json", dir=str(ruta.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(datos, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, ruta)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
+def _registrar_proceso_activo(proc: Any) -> None:
+    """Registra un subproceso Popen activo para garantizar su limpieza ante cancelación."""
+    if proc is None:
+        return
+    with _PROCESOS_ACTIVOS_LOCK:
+        _PROCESOS_ACTIVOS[id(proc)] = proc
+
+
+def _desregistrar_proceso_activo(proc: Any) -> None:
+    """Elimina un subproceso Popen del registro de activos."""
+    if proc is None:
+        return
+    with _PROCESOS_ACTIVOS_LOCK:
+        _PROCESOS_ACTIVOS.pop(id(proc), None)
+
+
+def _terminar_proceso_seguro(proc: Any) -> None:
+    """Termina de forma limpia un subproceso Popen y su grupo de procesos si sigue vivo."""
+    if proc is None:
+        return
+    try:
+        esta_vivo = getattr(proc, "poll", lambda: 0)() is None
+    except Exception:
+        esta_vivo = False
+    if not esta_vivo:
+        return
+
+    pid = getattr(proc, "pid", None)
+    if os.name == "posix" and isinstance(pid, int) and pid > 0:
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=1.5)
+                return
+            except subprocess.TimeoutExpired:
+                os.killpg(pgid, signal.SIGKILL)
+                proc.wait(timeout=2.0)
+                return
+        except (OSError, ProcessLookupError, subprocess.SubprocessError):
+            pass
+
+    try:
+        proc.kill()
+        proc.wait(timeout=2.0)
+    except Exception:
+        pass
+
+
+def terminar_procesos_activos() -> int:
+    """Finaliza todos los subprocesos FFmpeg/yt-dlp activos registrados (Ctrl+C o cierre UI)."""
+    with _PROCESOS_ACTIVOS_LOCK:
+        activos = list(_PROCESOS_ACTIVOS.values())
+    terminados = 0
+    for proc in activos:
+        try:
+            if getattr(proc, "poll", lambda: 0)() is None:
+                _terminar_proceso_seguro(proc)
+                terminados += 1
+        finally:
+            _cerrar_pipes_proceso(proc)
+            _desregistrar_proceso_activo(proc)
+    return terminados
+
+
+atexit.register(terminar_procesos_activos)
+
+
+def _cerrar_cliente_genai_seguro(client: Any) -> None:
+    """Cierra el cliente google-genai y su pool HTTP/event loop interno sin propagar errores."""
+    if client is None:
+        return
+    close_fn = getattr(client, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:
+            pass
+
+
+def _eliminar_archivo_gemini_seguro(client: Any, archivo_subido: Any) -> None:
+    """Elimina un archivo remoto de Gemini File API de forma segura."""
+    if client is None or archivo_subido is None:
+        return
+    nombre = getattr(archivo_subido, "name", None)
+    if not nombre:
+        return
+    try:
+        client.files.delete(name=nombre)
+    except Exception:
+        pass
+
+
+class OllamaCircuitBreaker:
+    """Circuit-breaker thread-safe para proteger al pipeline ante caídas del demonio Ollama."""
+
+    def __init__(self, failure_threshold: int = 3, cooldown_seconds: float = 30.0) -> None:
+        self._lock = threading.Lock()
+        self.failure_threshold = max(1, int(failure_threshold))
+        self.cooldown_seconds = max(1.0, float(cooldown_seconds))
+        self._failures = 0
+        self._opened_at: Optional[float] = None
+
+    def estado(self) -> str:
+        with self._lock:
+            if self._opened_at is None:
+                return "CLOSED"
+            if (time.monotonic() - self._opened_at) >= self.cooldown_seconds:
+                return "HALF_OPEN"
+            return "OPEN"
+
+    def permitir_peticion(self) -> bool:
+        return self.estado() != "OPEN"
+
+    def registrar_exito(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._opened_at = None
+
+    def registrar_fallo(self) -> str:
+        with self._lock:
+            self._failures += 1
+            if self._failures >= self.failure_threshold:
+                self._opened_at = time.monotonic()
+                return "OPEN"
+            return "CLOSED"
+
+    def reiniciar(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._opened_at = None
+
+
+OLLAMA_CIRCUIT_BREAKER = OllamaCircuitBreaker(failure_threshold=3, cooldown_seconds=30.0)
 
 
 def crear_contexto_job(url: str) -> JobContext:
@@ -687,7 +861,7 @@ def generar_archivo_ass(
     subtitulos: List[Any],
     ruta_ass: str | Path,
 ) -> str:
-    """Genera un archivo .ass v4.1 ópticamente centrado en Safe Zone 9:16 (WrapStyle: 0, Fontsize=50, MarginL=80, MarginR=170, MarginV=550)."""
+    """Genera un archivo .ass v4.1 ópticamente centrado en Safe Zone 9:16 (WrapStyle: 0, Fontsize=50, MarginL=120, MarginR=120, MarginV=450)."""
     ruta = Path(ruta_ass).resolve()
     ruta.parent.mkdir(parents=True, exist_ok=True)
     fuente_sub, _ = _obtener_fuente_y_dir_subtitulos()
@@ -705,7 +879,7 @@ def generar_archivo_ass(
             "",
             "[V4+ Styles]",
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            f"Style: Default,{fuente_sub},50,&H00FFFFFF,&H0000FFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,1.2,0,1,5.0,3.0,2,80,170,550,1",
+            f"Style: Default,{fuente_sub},50,&H00FFFFFF,&H0000FFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,1.2,0,1,5.0,3.0,2,120,120,450,1",
             "",
             "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -744,13 +918,41 @@ def generar_archivo_ass(
     return str(ruta)
 
 
+def _reparar_json_lista_truncada(limpio: str) -> Optional[list]:
+    """Extrae objetos JSON completos de un array truncado (ej. por max_tokens) usando JSONDecoder.raw_decode."""
+    idx_inicio = limpio.find("[")
+    if idx_inicio == -1:
+        return None
+    dec = json.JSONDecoder()
+    pos = idx_inicio + 1
+    n = len(limpio)
+    objetos: list = []
+    while pos < n:
+        while pos < n and limpio[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= n or limpio[pos] == "]":
+            break
+        if limpio[pos] != "{":
+            break
+        try:
+            obj, end_pos = dec.raw_decode(limpio, pos)
+            if isinstance(obj, dict):
+                objetos.append(obj)
+            pos = end_pos
+        except json.JSONDecodeError:
+            break
+    return objetos if objetos else None
+
+
 def _extraer_lista_json_con_esquema(
     texto: str,
     adapter: TypeAdapter[Any],
     clave_dict: str,
 ) -> list:
-    """Limpia bloques think/markdown y parsea una lista JSON validando con TypeAdapter o fallback regex."""
+    """Limpia bloques think/markdown, recupera arrays JSON truncados y valida con TypeAdapter."""
     limpio = re.sub(r"<think>.*?</think>", "", str(texto or ""), flags=re.IGNORECASE | re.DOTALL).strip()
+    if "<think>" in limpio.lower():
+        limpio = re.sub(r"<think>.*?(?=\{|\[|$)", "", limpio, flags=re.IGNORECASE | re.DOTALL).strip()
     limpio = re.sub(r"^```(?:json)?\s*", "", limpio, flags=re.IGNORECASE)
     limpio = re.sub(r"\s*```$", "", limpio)
     limpio = limpio.strip()
@@ -770,8 +972,14 @@ def _extraer_lista_json_con_esquema(
                     objetos = adapter.validate_json(bloque_json)
                     datos = [c.model_dump() for c in objetos]
                 except Exception:
-                    datos = json.loads(bloque_json)
+                    try:
+                        datos = json.loads(bloque_json)
+                    except Exception:
+                        datos = _reparar_json_lista_truncada(limpio)
             else:
+                datos = _reparar_json_lista_truncada(limpio)
+
+            if datos is None:
                 datos = json.loads(limpio)
 
     if isinstance(datos, dict):
@@ -903,7 +1111,7 @@ def _obtener_url_audio_directo(url: str) -> str:
         "-g",
         url,
     ]
-    res = subprocess.run(comando, capture_output=True, text=True, check=True)
+    res = subprocess.run(comando, capture_output=True, text=True, check=True, timeout=60)
     urls = [linea.strip() for linea in res.stdout.splitlines() if linea.strip()]
     if not urls:
         raise RuntimeError("yt-dlp -g no devolvió URL directa para extracción de audio.")
@@ -1017,14 +1225,17 @@ def _ejecutar_descarga_con_telemetria(
     detalle_default: str,
 ) -> str:
     """Ejecuta yt-dlp con Popen leyendo línea a línea y emitiendo telemetría en vivo."""
-    proc = subprocess.Popen(
-        comando,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
+    popen_kwargs: Dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "bufsize": 1,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(comando, **popen_kwargs)
+    _registrar_proceso_activo(proc)
     ultimas_lineas: List[str] = []
     ultimo_ts = [0.0]
 
@@ -1066,13 +1277,9 @@ def _ejecutar_descarga_con_telemetria(
 
         returncode = proc.wait()
     finally:
-        if getattr(proc, "poll", lambda: 0)() is None:
-            try:
-                proc.kill()
-                proc.wait(timeout=2.0)
-            except Exception:
-                pass
+        _terminar_proceso_seguro(proc)
         _cerrar_pipes_proceso(proc)
+        _desregistrar_proceso_activo(proc)
 
     salida_txt = "\n".join(ultimas_lineas)
     if returncode != 0:
@@ -1377,17 +1584,14 @@ Analiza el audio adjunto y extrae ÚNICAMENTE los segmentos con verdadero potenc
 
 
 def _guardar_y_sincronizar_clips(clips: List[dict], job_dir: Optional[Path | str] = None):
-    """Guarda clips.json en el job_dir (si aplica) y mantiene sincronizado BASE_DIR / 'clips.json'."""
-    if job_dir:
-        jdir = Path(job_dir).resolve()
-        jdir.mkdir(parents=True, exist_ok=True)
-        ruta_job_json = jdir / "clips.json"
-        with open(ruta_job_json, "w", encoding="utf-8") as f:
-            json.dump(clips, f, indent=2, ensure_ascii=False)
+    """Guarda clips.json en el job_dir (si aplica) y mantiene sincronizado BASE_DIR / 'clips.json' de forma atómica."""
+    with _CLIPS_JSON_LOCK:
+        if job_dir:
+            jdir = Path(job_dir).resolve()
+            jdir.mkdir(parents=True, exist_ok=True)
+            _escribir_json_atomico(jdir / "clips.json", clips)
 
-    ruta_raiz_json = BASE_DIR / "clips.json"
-    with open(ruta_raiz_json, "w", encoding="utf-8") as f:
-        json.dump(clips, f, indent=2, ensure_ascii=False)
+        _escribir_json_atomico(BASE_DIR / "clips.json", clips)
 
 
 def _esperar_con_jitter(
@@ -1546,11 +1750,7 @@ def _subir_archivo_gemini_activo(
         _log("✓ Archivo de audio listo y activo para inferencia.")
         return archivo_subido
     except BaseException:
-        if archivo_subido is not None and getattr(archivo_subido, "name", None):
-            try:
-                client.files.delete(name=archivo_subido.name)
-            except Exception:
-                pass
+        _eliminar_archivo_gemini_seguro(client, archivo_subido)
         raise
 
 
@@ -1620,16 +1820,20 @@ def _ejecutar_cascada_modelos_gemini(
                 break
             except ServerError as e:
                 codigo_err = getattr(e, "code", None) or 503
-                _esperar_con_jitter(
-                    intento,
-                    base=4.0,
-                    max_espera=25.0,
-                    on_log=on_log,
-                    contexto=(
-                        f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
-                        f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {e}"
-                    ),
+                msg_srv = (
+                    f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
+                    f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {e}"
                 )
+                if intento < max_intentos:
+                    _esperar_con_jitter(
+                        intento,
+                        base=4.0,
+                        max_espera=25.0,
+                        on_log=on_log,
+                        contexto=msg_srv,
+                    )
+                else:
+                    _log(msg_srv)
             except APIError as e:
                 codigo_err = getattr(e, "code", None) or "APIError"
                 detalle_err = getattr(e, "message", None) or str(e)
@@ -1652,16 +1856,20 @@ def _ejecutar_cascada_modelos_gemini(
                     )
                     break
                 if codigo_err in (429, 503):
-                    _esperar_con_jitter(
-                        intento,
-                        base=4.0,
-                        max_espera=25.0,
-                        on_log=on_log,
-                        contexto=(
-                            f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
-                            f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {detalle_err}"
-                        ),
+                    msg_api = (
+                        f"[AVISO] Modelo {modelo} falló (código {codigo_err}, "
+                        f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {detalle_err}"
                     )
+                    if intento < max_intentos:
+                        _esperar_con_jitter(
+                            intento,
+                            base=4.0,
+                            max_espera=25.0,
+                            on_log=on_log,
+                            contexto=msg_api,
+                        )
+                    else:
+                        _log(msg_api)
                 else:
                     _log(
                         f"[AVISO] Modelo {modelo} falló (código {codigo_err}, espera 0.00s "
@@ -1673,16 +1881,20 @@ def _ejecutar_cascada_modelos_gemini(
                 msg_err = str(e)
                 if "429" in msg_err or "RESOURCE_EXHAUSTED" in msg_err.upper():
                     vio_error_429 = True
-                _esperar_con_jitter(
-                    intento,
-                    base=4.0,
-                    max_espera=25.0,
-                    on_log=on_log,
-                    contexto=(
-                        f"[AVISO] Modelo {modelo} falló (error {codigo_err}, "
-                        f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {e}"
-                    ),
+                msg_gen = (
+                    f"[AVISO] Modelo {modelo} falló (error {codigo_err}, "
+                    f"intento {intento}/{max_intentos}) antes de {accion_siguiente}: {e}"
                 )
+                if intento < max_intentos:
+                    _esperar_con_jitter(
+                        intento,
+                        base=4.0,
+                        max_espera=25.0,
+                        on_log=on_log,
+                        contexto=msg_gen,
+                    )
+                else:
+                    _log(msg_gen)
         if resultado is not None:
             break
 
@@ -1777,11 +1989,7 @@ def _analizar_archivo_audio_gemini(
             c["modelo_ia"] = modelo_usado
         return clips
     finally:
-        if archivo_subido is not None and getattr(archivo_subido, "name", None):
-            try:
-                client.files.delete(name=archivo_subido.name)
-            except Exception:
-                pass
+        _eliminar_archivo_gemini_seguro(client, archivo_subido)
 
 
 def _puntaje_calidad_clip(clip: dict, duracion: float) -> Tuple[float, int, int]:
@@ -2090,6 +2298,7 @@ def analizar_con_gemini(
         _log(f"✓ Se detectaron {len(clips_finales)} momentos virales con SEO completo y se guardaron en clips.json")
         return clips_finales
     finally:
+        _cerrar_cliente_genai_seguro(client)
         for ruta_c in chunks_temporales:
             try:
                 if os.path.exists(ruta_c):
@@ -2287,8 +2496,8 @@ def _calcular_energia_segmentos_audio(
         "-",
     ]
     try:
-        proc = subprocess.run(comando, capture_output=True, check=False)
-    except OSError:
+        proc = subprocess.run(comando, capture_output=True, check=False, timeout=300)
+    except (OSError, subprocess.SubprocessError):
         return set()
 
     if proc.returncode != 0 or not proc.stdout:
@@ -2300,6 +2509,7 @@ def _calcular_energia_segmentos_audio(
 
     muestras = array.array("h")
     muestras.frombytes(proc.stdout[:n_bytes])
+    del proc
     if sys.byteorder != "little":
         muestras.byteswap()
 
@@ -2321,6 +2531,7 @@ def _calcular_energia_segmentos_audio(
         tramo = muestras[i0:i1]
         energia = sum(map(int.__mul__, tramo, tramo)) / n
         rms_por_seg.append(math.sqrt(energia))
+    del muestras
 
     positivos = [r for r in rms_por_seg if r > 0.0]
     if not positivos:
@@ -2620,8 +2831,8 @@ def _construir_subtitulos_desde_whisper(
             if (
                 siguiente is None
                 or len(buf) >= 4
-                or pausa_sig >= 0.45
-                or (len(buf) >= 2 and (termina_puntuacion or largo_siguiente > 24))
+                or pausa_sig >= 0.65
+                or (len(buf) >= 2 and (termina_puntuacion or largo_siguiente > 26))
             ):
                 _volcar_buffer()
     elif segmentos:
@@ -2901,6 +3112,11 @@ def analizar_con_ollama(
             clips_bloque: List[dict] = []
             ultimo_error: Optional[Exception] = None
             for intento in range(1, 3):
+                if not OLLAMA_CIRCUIT_BREAKER.permitir_peticion():
+                    raise RuntimeError(
+                        f"Circuit-breaker de Ollama abierto tras fallos consecutivos ({modelo_elegido}). "
+                        "Verifica que 'ollama serve' esté activo."
+                    )
                 try:
                     texto_resp = _llamar_ollama_chat(
                         modelo_elegido,
@@ -2908,6 +3124,7 @@ def analizar_con_ollama(
                         num_ctx=num_ctx,
                         on_chunk_texto=_on_chunk_local,
                     )
+                    OLLAMA_CIRCUIT_BREAKER.registrar_exito()
                     clips_bloque = _limpiar_y_parsear_json(
                         texto_resp,
                         duracion_total=dur_bloque,
@@ -2916,11 +3133,40 @@ def analizar_con_ollama(
                     if clips_bloque or total_b > 1:
                         break
                     raise ValueError("Ollama devolvió una lista de clips vacía.")
+                except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err_red_ol:
+                    ultimo_error = err_red_ol
+                    estado_cb = OLLAMA_CIRCUIT_BREAKER.registrar_fallo()
+                    msg_ol = (
+                        f"[AVISO] Ollama ({modelo_elegido}) bloque {idx_b}/{total_b} "
+                        f"fallo de conexión/demonio ({type(err_red_ol).__name__}, circuito={estado_cb}): {err_red_ol}"
+                    )
+                    if estado_cb == "OPEN":
+                        _log(msg_ol)
+                        raise RuntimeError(
+                            f"Circuit-breaker de Ollama abierto tras fallos de conexión ({modelo_elegido}): {err_red_ol}"
+                        ) from err_red_ol
+                    if intento < 2:
+                        _esperar_con_jitter(
+                            intento,
+                            base=2.0,
+                            max_espera=8.0,
+                            on_log=_log,
+                            contexto=msg_ol,
+                        )
+                    else:
+                        _log(msg_ol)
                 except Exception as err_ol:
                     ultimo_error = err_ol
                     _log(
                         f"[AVISO] Ollama ({modelo_elegido}) bloque {idx_b}/{total_b} intento {intento}/2: {err_ol}"
                     )
+                    if intento < 2:
+                        _esperar_con_jitter(
+                            intento,
+                            base=1.5,
+                            max_espera=5.0,
+                            on_log=_log,
+                        )
 
             if not clips_bloque and total_b == 1 and ultimo_error is not None:
                 raise ultimo_error
@@ -3031,6 +3277,16 @@ def descargar_video_fuente(
         "ejs:github",
         "--no-playlist",
         "--force-overwrites",
+        "--concurrent-fragments",
+        "16",
+        "--retries",
+        "10",
+        "--fragment-retries",
+        "10",
+        "--retry-sleep",
+        "fragment:exp=1:10",
+        "--socket-timeout",
+        "15",
         "-f",
         FORMATOS_VIDEO_RAPIDOS,
         "--merge-output-format",
@@ -3039,13 +3295,21 @@ def descargar_video_fuente(
         str(ruta_destino),
         url,
     ]
-    _ejecutar_descarga_con_telemetria(
-        comando,
-        on_telemetria=on_telemetria,
-        etapa="descarga_video",
-        titulo_etapa="Descargando Video Fuente (1080p)",
-        detalle_default="Descarga 1080p activa",
-    )
+    try:
+        _ejecutar_descarga_con_telemetria(
+            comando,
+            on_telemetria=on_telemetria,
+            etapa="descarga_video",
+            titulo_etapa="Descargando Video Fuente (1080p)",
+            detalle_default="Descarga 1080p activa",
+        )
+    except BaseException:
+        for resto_part in glob.glob(f"{ruta_destino}.*"):
+            try:
+                os.remove(resto_part)
+            except OSError:
+                pass
+        raise
     if not ruta_destino.exists():
         raise FileNotFoundError(f"No se generó el video fuente: {ruta_destino}")
     _emitir_telemetria(
@@ -3070,39 +3334,41 @@ def obtener_urls_stream(
     job_id: Optional[str] = None,
     forzar_recarga: bool = False,
 ) -> List[str]:
-    """Obtiene URLs directas del stream con yt-dlp -g usando caché en memoria por job_id."""
+    """Obtiene URLs directas del stream con yt-dlp -g usando caché thread-safe y lock por job_id."""
     clave_cache = job_id or f"anon:{url}"
-    if not forzar_recarga:
-        entrada = STREAM_URL_CACHE.obtener(clave_cache, url)
-        if entrada:
-            urls_cacheadas = [
-                u for u in (entrada.get("video_url"), entrada.get("audio_url")) if u
-            ]
-            if urls_cacheadas:
-                print(f"Usando URLs de stream en caché para job '{clave_cache}'.")
-                return urls_cacheadas
+    lock_job = _obtener_lock_stream_job(clave_cache)
+    with lock_job:
+        if not forzar_recarga:
+            entrada = STREAM_URL_CACHE.obtener(clave_cache, url)
+            if entrada:
+                urls_cacheadas = [
+                    u for u in (entrada.get("video_url"), entrada.get("audio_url")) if u
+                ]
+                if urls_cacheadas:
+                    print(f"Usando URLs de stream en caché para job '{clave_cache}'.")
+                    return urls_cacheadas
 
-    comando = [
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "--js-runtimes",
-        "node",
-        "--remote-components",
-        "ejs:github",
-        "--no-playlist",
-        "-f",
-        FORMATOS_VIDEO_RAPIDOS,
-        "-g",
-        url,
-    ]
-    res = subprocess.run(comando, capture_output=True, text=True, check=True)
-    urls = [linea.strip() for linea in res.stdout.splitlines() if linea.strip()]
-    if not urls:
-        raise RuntimeError("yt-dlp no devolvió URLs de stream válidas.")
-    urls_finales = urls[:2]
-    STREAM_URL_CACHE.guardar(clave_cache, url, urls_finales)
-    return urls_finales
+        comando = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--js-runtimes",
+            "node",
+            "--remote-components",
+            "ejs:github",
+            "--no-playlist",
+            "-f",
+            FORMATOS_VIDEO_RAPIDOS,
+            "-g",
+            url,
+        ]
+        res = subprocess.run(comando, capture_output=True, text=True, check=True, timeout=60)
+        urls = [linea.strip() for linea in res.stdout.splitlines() if linea.strip()]
+        if not urls:
+            raise RuntimeError("yt-dlp no devolvió URLs de stream válidas.")
+        urls_finales = urls[:2]
+        STREAM_URL_CACHE.guardar(clave_cache, url, urls_finales)
+        return urls_finales
 
 
 def detectar_encoder_hardware(device_path: str = VAAPI_DEVICE) -> str:
@@ -3256,15 +3522,18 @@ def _ejecutar_comando_con_captura(
     """Ejecuta un comando capturando stderr y parseando -progress pipe:1 cuando está habilitado."""
     usa_progress = "-progress" in comando
     if usa_progress:
-        proc = subprocess.Popen(
-            comando,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            bufsize=1,
-        )
+        popen_kwargs: Dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "errors": "replace",
+            "bufsize": 1,
+        }
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(comando, **popen_kwargs)
+        _registrar_proceso_activo(proc)
         stderr_chunks: List[str] = []
 
         def _leer_stderr() -> None:
@@ -3365,26 +3634,25 @@ def _ejecutar_comando_con_captura(
 
             returncode = proc.wait()
         finally:
-            if getattr(proc, "poll", lambda: 0)() is None:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=2.0)
-                except Exception:
-                    pass
+            _terminar_proceso_seguro(proc)
             hilo_err.join(timeout=2.0)
             _cerrar_pipes_proceso(proc)
+            _desregistrar_proceso_activo(proc)
 
         salida_txt = "".join(stderr_chunks)
         if returncode != 0:
             raise subprocess.CalledProcessError(returncode, comando, output=salida_txt, stderr=salida_txt)
         return salida_txt
 
-    proc = subprocess.Popen(
-        comando,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
+    popen_kwargs_raw: Dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+    }
+    if os.name == "posix":
+        popen_kwargs_raw["start_new_session"] = True
+    proc = subprocess.Popen(comando, **popen_kwargs_raw)
+    _registrar_proceso_activo(proc)
     chunks: List[bytes] = []
     try:
         assert proc.stdout is not None
@@ -3405,13 +3673,9 @@ def _ejecutar_comando_con_captura(
                     pass
         returncode = proc.wait()
     finally:
-        if getattr(proc, "poll", lambda: 0)() is None:
-            try:
-                proc.kill()
-                proc.wait(timeout=2.0)
-            except Exception:
-                pass
+        _terminar_proceso_seguro(proc)
         _cerrar_pipes_proceso(proc)
+        _desregistrar_proceso_activo(proc)
 
     salida_txt = b"".join(chunks).decode("utf-8", errors="replace")
     if returncode != 0:
@@ -3528,16 +3792,40 @@ def _alinear_subtitulos_con_clip_renderizado(
         )
         return subtitulos
     finally:
-        if client is not None and archivo_subido is not None and getattr(archivo_subido, "name", None):
-            try:
-                client.files.delete(name=archivo_subido.name)
-            except Exception:
-                pass
+        _eliminar_archivo_gemini_seguro(client, archivo_subido)
+        _cerrar_cliente_genai_seguro(client)
         if ruta_audio_clip.exists():
             try:
                 os.remove(ruta_audio_clip)
             except OSError:
                 pass
+
+
+def _construir_filtro_subtitulos(
+    ruta_ass: str | Path, fonts_dir: Optional[str | Path] = None
+) -> str:
+    """Construye el filtro libass subtitles='<ruta>'[:fontsdir='<dir>'] escapado para FFmpeg."""
+    ruta_esc = _escapar_ruta_ffmpeg_filtro(ruta_ass)
+    if fonts_dir:
+        fonts_esc = _escapar_ruta_ffmpeg_filtro(fonts_dir)
+        return f"subtitles='{ruta_esc}':fontsdir='{fonts_esc}'"
+    return f"subtitles='{ruta_esc}'"
+
+
+def _args_codec_video(encoder: str) -> Tuple[str, List[str]]:
+    """Devuelve (filtro_formato_salida, args_codec_ffmpeg) para h264_vaapi o libx264."""
+    if encoder == "h264_vaapi":
+        return "format=nv12,hwupload", ["-c:v", "h264_vaapi", "-qp", "23"]
+    return "format=yuv420p", [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-threads",
+        "0",
+    ]
 
 
 def _construir_comando_quemar_ass(
@@ -3563,28 +3851,9 @@ def _construir_comando_quemar_ass(
 
     comando.extend(["-i", str(ruta_video_raw)])
 
-    ruta_esc = _escapar_ruta_ffmpeg_filtro(ruta_ass)
-    if fonts_dir:
-        fonts_esc = _escapar_ruta_ffmpeg_filtro(fonts_dir)
-        filtro_subs = f"subtitles='{ruta_esc}':fontsdir='{fonts_esc}'"
-    else:
-        filtro_subs = f"subtitles='{ruta_esc}'"
-
-    if encoder == "h264_vaapi":
-        vf = f"{filtro_subs},format=nv12,hwupload"
-        codec_args = ["-c:v", "h264_vaapi", "-qp", "23"]
-    else:
-        vf = f"{filtro_subs},format=yuv420p"
-        codec_args = [
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "22",
-            "-threads",
-            "0",
-        ]
+    filtro_subs = _construir_filtro_subtitulos(ruta_ass, fonts_dir)
+    fmt_salida, codec_args = _args_codec_video(encoder)
+    vf = f"{filtro_subs},{fmt_salida}"
 
     comando.extend(
         [
@@ -3677,16 +3946,9 @@ def _construir_comando_render(
 
     cadena_final = [f"[vid_comp][wm]overlay=(W-w)/2:{y_watermark}"]
     if ruta_ass:
-        ruta_esc = _escapar_ruta_ffmpeg_filtro(ruta_ass)
-        if fonts_dir:
-            fonts_esc = _escapar_ruta_ffmpeg_filtro(fonts_dir)
-            cadena_final.append(f"subtitles='{ruta_esc}':fontsdir='{fonts_esc}'")
-        else:
-            cadena_final.append(f"subtitles='{ruta_esc}'")
-    if encoder == "h264_vaapi":
-        cadena_final.append("format=nv12,hwupload[outv]")
-    else:
-        cadena_final.append("format=yuv420p[outv]")
+        cadena_final.append(_construir_filtro_subtitulos(ruta_ass, fonts_dir))
+    fmt_salida, codec_args = _args_codec_video(encoder)
+    cadena_final.append(f"{fmt_salida}[outv]")
     partes_filtro.append(",".join(cadena_final))
     filtro = ";".join(partes_filtro)
 
@@ -3700,27 +3962,7 @@ def _construir_comando_render(
             idx_audio,
             "-t",
             duracion_str,
-        ]
-    )
-
-    if encoder == "h264_vaapi":
-        comando.extend(["-c:v", "h264_vaapi", "-qp", "23"])
-    else:
-        comando.extend(
-            [
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "22",
-                "-threads",
-                "0",
-            ]
-        )
-
-    comando.extend(
-        [
+            *codec_args,
             "-c:a",
             "aac",
             "-b:a",
@@ -4146,24 +4388,28 @@ def _ejecutar_paso_con_telemetria(
 
     hilo = threading.Thread(target=_worker, daemon=True)
     hilo.start()
-    while True:
-        try:
-            tipo, payload = cola.get(timeout=0.5)
-        except queue.Empty:
-            if not hilo.is_alive() and cola.empty():
-                raise RuntimeError(
-                    f"El hilo worker de '{getattr(fn, '__name__', 'etapa')}' finalizó sin resultado."
-                )
-            continue
+    try:
+        while True:
+            try:
+                tipo, payload = cola.get(timeout=0.5)
+            except queue.Empty:
+                if not hilo.is_alive() and cola.empty():
+                    raise RuntimeError(
+                        f"El hilo worker de '{getattr(fn, '__name__', 'etapa')}' finalizó sin resultado."
+                    )
+                continue
 
-        if tipo == "tele":
-            yield construir_estado(payload)
-        elif tipo == "ok":
-            hilo.join(timeout=1.0)
-            return payload
-        elif tipo == "err":
-            hilo.join(timeout=1.0)
-            raise payload
+            if tipo == "tele":
+                yield construir_estado(payload)
+            elif tipo == "ok":
+                hilo.join(timeout=1.0)
+                return payload
+            elif tipo == "err":
+                hilo.join(timeout=1.0)
+                raise payload
+    except (KeyboardInterrupt, GeneratorExit):
+        terminar_procesos_activos()
+        raise
 
 
 def _orquestar_render_y_subida(
@@ -4386,40 +4632,56 @@ def _orquestar_render_y_subida(
                 )
 
             try:
-                kwargs_render: Dict[str, Any] = {
-                    "job_id": job_id,
-                    "subtitulos": clip.get("subtitulos"),
-                    "job_dir": job_dir,
-                }
-                if acepta_clip_idx:
-                    kwargs_render["clip_indice"] = idx
-                if acepta_total_clips:
-                    kwargs_render["total_clips"] = total_clips
-                if acepta_on_log:
-                    kwargs_render["on_log"] = _log
-                if acepta_on_tele:
-                    kwargs_render["on_telemetria"] = _on_tele_clip
-                if acepta_alinear_subs:
-                    kwargs_render["alinear_subtitulos"] = (
-                        bool(alinear_subtitulos)
-                        and clip.get("subtitulos_origen") != "whisper_word_timestamps"
+                ruta_existente = clip.get("archivo_local")
+                if (
+                    clip.get("render_status") == "OK"
+                    and ruta_existente
+                    and os.path.isfile(str(ruta_existente))
+                    and os.path.getsize(str(ruta_existente)) > 0
+                ):
+                    salida = str(Path(str(ruta_existente)).resolve())
+                    with state_lock:
+                        clip["archivo_local"] = salida
+                        ultimo_video = salida
+                        progreso_clip[idx] = 1.0
+                    _log(f"✓ Reutilizando Clip #{cid} ya renderizado en caché: {salida}")
+                else:
+                    kwargs_render: Dict[str, Any] = {
+                        "job_id": job_id,
+                        "subtitulos": clip.get("subtitulos"),
+                        "job_dir": job_dir,
+                    }
+                    if acepta_clip_idx:
+                        kwargs_render["clip_indice"] = idx
+                    if acepta_total_clips:
+                        kwargs_render["total_clips"] = total_clips
+                    if acepta_on_log:
+                        kwargs_render["on_log"] = _log
+                    if acepta_on_tele:
+                        kwargs_render["on_telemetria"] = _on_tele_clip
+                    if acepta_alinear_subs:
+                        kwargs_render["alinear_subtitulos"] = (
+                            bool(alinear_subtitulos)
+                            and clip.get("subtitulos_origen") != "whisper_word_timestamps"
+                        )
+
+                    salida = procesar_clip_ffmpeg(
+                        entrada_render,
+                        clip.get("inicio"),
+                        clip.get("fin"),
+                        str(cid),
+                        **kwargs_render,
                     )
+                    with state_lock:
+                        clip["archivo_local"] = salida
+                        clip["render_status"] = "OK"
+                        ultimo_video = salida
+                        progreso_clip[idx] = 1.0
+                    _log(f"✓ Clip #{cid} renderizado en: {salida}")
 
-                salida = procesar_clip_ffmpeg(
-                    entrada_render,
-                    clip.get("inicio"),
-                    clip.get("fin"),
-                    str(cid),
-                    **kwargs_render,
-                )
-                with state_lock:
-                    clip["archivo_local"] = salida
-                    clip["render_status"] = "OK"
-                    ultimo_video = salida
-                    progreso_clip[idx] = 1.0
-                _log(f"✓ Clip #{cid} renderizado en: {salida}")
-
-                if not subir_youtube:
+                if clip.get("youtube_url") or clip.get("youtube_id"):
+                    _log(f"✓ Clip #{cid} ya registrado en YouTube ({clip.get('youtube_url') or clip.get('youtube_id')}); omitiendo re-subida.")
+                elif not subir_youtube:
                     with state_lock:
                         clip["youtube_status"] = "Subida omitida (--sin-subida)"
                 elif youtube_client is None:
@@ -4549,6 +4811,7 @@ def _orquestar_render_y_subida(
             for fut in futuros:
                 fut.result()
         except BaseException:
+            terminar_procesos_activos()
             executor.shutdown(wait=False, cancel_futures=True)
             raise
         else:
@@ -4607,8 +4870,9 @@ def ejecutar_pipeline_completo(
     motor_ia: str = "gemini",
     modelo_local: Optional[str] = None,
     respaldo_local_auto: bool = True,
+    job_dir: Optional[Path | str] = None,
 ) -> Generator[Dict[str, Any], None, None]:
-    """Orquestador único (CLI y GUI) que ejecuta el pipeline híbrido (Gemini/Local) con telemetría."""
+    """Orquestador único (CLI y GUI) que ejecuta el pipeline híbrido (Gemini/Local) con telemetría y reanudación."""
     def _log(msg: str) -> None:
         if on_log is not None:
             on_log(msg)
@@ -4645,7 +4909,15 @@ def ejecutar_pipeline_completo(
             yield _emitir_estado("error", 0.0, msg, error=msg)
             return
 
-    ctx = crear_contexto_job(url_limpia)
+    reanudando = False
+    if job_dir:
+        ruta_jdir = Path(job_dir).resolve()
+        reanudando = ruta_jdir.exists()
+        ruta_jdir.mkdir(parents=True, exist_ok=True)
+        ctx = JobContext(job_id=ruta_jdir.name, job_dir=ruta_jdir)
+    else:
+        ctx = crear_contexto_job(url_limpia)
+
     try:
         eliminados = _limpiar_jobs_antiguos(dias_retencion=7, job_dir_actual=ctx.job_dir)
         if eliminados:
@@ -4653,61 +4925,78 @@ def ejecutar_pipeline_completo(
                 f"Limpieza automática: {eliminados} carpeta(s) antigua(s) (>7 días) "
                 f"eliminada(s) de {CARPETA_JOBS}"
             )
-    except Exception:
+    except OSError:
         pass
     job_dir_str = str(ctx.job_dir)
-    _log(f"Iniciando Job {ctx.job_id} en {ctx.job_dir}")
+    _log(f"{'Reanudando' if reanudando else 'Iniciando'} Job {ctx.job_id} en {ctx.job_dir}")
 
     audio_temp: Optional[str] = None
     clips: List[dict] = []
     ultimo_video: Optional[str] = None
+    pipeline_completado = False
 
     try:
-        _log(f"Fase 1/4: Extrayendo pista de audio desde {url_limpia}...")
-        tele_audio_init = {
-            "etapa": "descarga",
-            "titulo_etapa": "Descargando Audio del Stream (16 Hilos)",
-            "porcentaje": 0.0,
-            "velocidad_red": "--",
-            "tamano_total": "--",
-            "eta": "--:--",
-            "detalle": f"Preparando extracción en jobs/{ctx.job_id}",
-        }
-        if on_telemetria is not None:
-            on_telemetria(dict(tele_audio_init))
-        yield _emitir_estado(
-            fase="audio",
-            progreso=0.05,
-            mensaje=f"Fase 1/4: Extrayendo audio ligero en jobs/{ctx.job_id}...",
-            clips=clips,
-            ultimo_video=ultimo_video,
-            job_dir=job_dir_str,
-            telemetria=tele_audio_init,
-        )
-        kwargs_audio: Dict[str, Any] = {"job_dir": ctx.job_dir}
-        if _acepta_kwarg(extraer_audio, "on_log"):
-            kwargs_audio["on_log"] = _log
-        audio_temp = yield from _ejecutar_paso_con_telemetria(
-            extraer_audio,
-            url_limpia,
-            construir_estado=lambda tele: _emitir_estado(
+        audio_cache = ctx.job_dir / "temp_audio.mp3"
+        clips_cache = ctx.job_dir / "clips.json"
+        if reanudando and clips_cache.is_file():
+            try:
+                datos_cache = json.loads(clips_cache.read_text(encoding="utf-8"))
+                if isinstance(datos_cache, list) and datos_cache:
+                    clips = [c for c in datos_cache if isinstance(c, dict)]
+            except (OSError, json.JSONDecodeError, ValueError):
+                clips = []
+
+        if reanudando and audio_cache.is_file() and audio_cache.stat().st_size > 10_240:
+            audio_temp = str(audio_cache.resolve())
+            duracion = obtener_duracion_media(audio_temp)
+            dur_str = segundos_a_hhmmss(duracion) if duracion else "Desconocida"
+            _log(f"✓ Reutilizando audio en caché ({audio_temp}) | Duración: {dur_str}")
+        else:
+            _log(f"Fase 1/4: Extrayendo pista de audio desde {url_limpia}...")
+            tele_audio_init = {
+                "etapa": "descarga",
+                "titulo_etapa": "Descargando Audio del Stream (16 Hilos)",
+                "porcentaje": 0.0,
+                "velocidad_red": "--",
+                "tamano_total": "--",
+                "eta": "--:--",
+                "detalle": f"Preparando extracción en jobs/{ctx.job_id}",
+            }
+            if on_telemetria is not None:
+                on_telemetria(dict(tele_audio_init))
+            yield _emitir_estado(
                 fase="audio",
-                progreso=0.05 + 0.23 * (float(tele.get("porcentaje", 0.0)) / 100.0),
-                mensaje=(
-                    f"Fase 1/4: {tele.get('titulo_etapa', 'Extrayendo audio')} "
-                    f"({tele.get('porcentaje', 0):.1f}% • {tele.get('velocidad_red', '--')})"
-                ),
+                progreso=0.05,
+                mensaje=f"Fase 1/4: Extrayendo audio ligero en jobs/{ctx.job_id}...",
                 clips=clips,
                 ultimo_video=ultimo_video,
                 job_dir=job_dir_str,
-                telemetria=tele,
-            ),
-            on_telemetria_externa=on_telemetria,
-            **kwargs_audio,
-        )
-        duracion = obtener_duracion_media(audio_temp)
-        dur_str = segundos_a_hhmmss(duracion) if duracion else "Desconocida"
-        _log(f"✓ Audio extraído correctamente ({audio_temp}) | Duración: {dur_str}")
+                telemetria=tele_audio_init,
+            )
+            kwargs_audio: Dict[str, Any] = {"job_dir": ctx.job_dir}
+            if _acepta_kwarg(extraer_audio, "on_log"):
+                kwargs_audio["on_log"] = _log
+            audio_temp = yield from _ejecutar_paso_con_telemetria(
+                extraer_audio,
+                url_limpia,
+                construir_estado=lambda tele: _emitir_estado(
+                    fase="audio",
+                    progreso=0.05 + 0.23 * (float(tele.get("porcentaje", 0.0)) / 100.0),
+                    mensaje=(
+                        f"Fase 1/4: {tele.get('titulo_etapa', 'Extrayendo audio')} "
+                        f"({tele.get('porcentaje', 0):.1f}% • {tele.get('velocidad_red', '--')})"
+                    ),
+                    clips=clips,
+                    ultimo_video=ultimo_video,
+                    job_dir=job_dir_str,
+                    telemetria=tele,
+                ),
+                on_telemetria_externa=on_telemetria,
+                **kwargs_audio,
+            )
+            duracion = obtener_duracion_media(audio_temp)
+            dur_str = segundos_a_hhmmss(duracion) if duracion else "Desconocida"
+            _log(f"✓ Audio extraído correctamente ({audio_temp}) | Duración: {dur_str}")
 
         modelo_local_efectivo = _normalizar_modelo_ollama(modelo_local)
         motor_efectivo = motor_normalizado
@@ -4763,7 +5052,11 @@ def ejecutar_pipeline_completo(
             )
             return res_local
 
-        if motor_normalizado == "local":
+        if clips:
+            _log(f"✓ Reutilizando {len(clips)} clip(s) desde caché de reanudación ({ctx.job_dir / 'clips.json'})")
+            if any(c.get("motor_ia") == "local" or c.get("subtitulos_origen") == "whisper_word_timestamps" for c in clips):
+                motor_efectivo = "local"
+        elif motor_normalizado == "local":
             clips = yield from _correr_analisis_local(modelo_local_efectivo)
         else:
             modelo_label = (modelo_preferido or MODELOS_CANDIDATOS[0]).strip()
@@ -4834,6 +5127,7 @@ def ejecutar_pipeline_completo(
             )
 
         if solo_analisis:
+            pipeline_completado = True
             msg_fin = (
                 f"Análisis viral completado ({len(clips)} clips) en jobs/{ctx.job_id}/clips.json y clips.json."
             )
@@ -4878,6 +5172,7 @@ def ejecutar_pipeline_completo(
                 ultimo_video = estado_lote["ultimo_video"]
             yield estado_lote
 
+        pipeline_completado = True
         render_ok = sum(1 for c in clips if c.get("render_status") == "OK")
         render_err = len(clips) - render_ok
         subidos_ok = sum(1 for c in clips if c.get("youtube_url"))
@@ -4930,7 +5225,7 @@ def ejecutar_pipeline_completo(
         )
     finally:
         STREAM_URL_CACHE.invalidar(ctx.job_id)
-        if audio_temp and os.path.exists(audio_temp):
+        if pipeline_completado and audio_temp and os.path.exists(audio_temp):
             try:
                 os.remove(audio_temp)
             except OSError:
@@ -5126,6 +5421,11 @@ def main():
         default=0,
         help="Intervalo en horas entre Shorts programados (0-24)",
     )
+    parser.add_argument(
+        "--job-dir",
+        default=None,
+        help="Directorio de job existente (jobs/<id>) para reanudar desde checkpoints",
+    )
     args = parser.parse_args()
 
     cli_ui = RenderizadorProgresoCLI()
@@ -5142,10 +5442,12 @@ def main():
             motor_ia=args.motor,
             modelo_local=args.modelo_local,
             respaldo_local_auto=not args.sin_respaldo_local,
+            job_dir=args.job_dir,
         ):
             ultimo_estado = estado
             cli_ui.actualizar(estado)
     finally:
+        terminar_procesos_activos()
         cli_ui.finalizar()
 
     if not ultimo_estado or ultimo_estado.get("error"):

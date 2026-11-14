@@ -534,7 +534,7 @@ class TestFase4SubtitulosYEstilosASS(unittest.TestCase):
             contenido = Path(salida).read_text(encoding="utf-8")
             self.assertIn("WrapStyle: 0", contenido)
             self.assertIn(
-                "Style: Default,Montserrat ExtraBold,50,&H00FFFFFF,&H0000FFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,1.2,0,1,5.0,3.0,2,80,170,550,1",
+                "Style: Default,Montserrat ExtraBold,50,&H00FFFFFF,&H0000FFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,1.2,0,1,5.0,3.0,2,120,120,450,1",
                 contenido,
             )
             popin = r"{\fad(40,40)\t(0,70,\fscx105\fscy105)\t(70,140,\fscx100\fscy100)}"

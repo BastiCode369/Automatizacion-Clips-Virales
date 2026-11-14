@@ -416,9 +416,9 @@ class TestTarea3AlineacionYRenderDosPasos(unittest.TestCase):
             self.assertEqual(campos[16], "5.0")
             self.assertEqual(campos[17], "3.0")
             self.assertEqual(campos[18], "2")
-            self.assertEqual(campos[19], "80")
-            self.assertEqual(campos[20], "170")
-            self.assertEqual(campos[21], "550")
+            self.assertEqual(campos[19], "120")
+            self.assertEqual(campos[20], "120")
+            self.assertEqual(campos[21], "450")
             self.assertIn("QUÉ (LOCURA) HERMANO", contenido)
             self.assertIn("CLIP VIRAL CENTRADO", contenido)
 
@@ -631,9 +631,9 @@ class TestTarea3AlineacionYRenderDosPasos(unittest.TestCase):
             self.assertEqual(cmd_p2[cmd_p2.index("-c:a") + 1], "copy")
             self.assertEqual(Path(cmd_p2[-1]).resolve(), Path(salida).resolve())
             self.assertTrue(Path(salida).exists())
-            # El archivo ASS contiene los márgenes ópticos Safe Zone 80,170 y el texto alineado
+            # El archivo ASS contiene los márgenes ópticos Safe Zone 120,120,450 y el texto alineado
             ass_texto = (job_dir / "subs_3.ass").read_text(encoding="utf-8")
-            self.assertIn(",80,170,550,1", ass_texto)
+            self.assertIn(",120,120,450,1", ass_texto)
             self.assertIn("SUB ALINEADO", ass_texto)
             # Cleanup del raw_clip_3.mp4 en finally
             self.assertFalse((job_dir / "raw_clip_3.mp4").exists())
