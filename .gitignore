@@ -16,3 +16,24 @@ gradio.log
 # Caché Python
 __pycache__/
 *.py[cod]
+
+# === ZERO-SECRETS (Credenciales y Tokens) ===
+.env
+client_secret.json
+token.json
+token_cuenta_anterior.json
+*secret*.json
+*token*.json
+
+# === Entorno y Caché ===
+venv/
+__pycache__/
+*.pyc
+gradio.log
+
+# === Multimedia y Trabajos Temporales ===
+clips_finales/*.mp4
+jobs/
+*.mp4
+*.mp3
+*.wav
