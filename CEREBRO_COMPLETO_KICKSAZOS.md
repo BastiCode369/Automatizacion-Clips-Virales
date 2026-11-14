@@ -13,7 +13,7 @@
 
 Opera mediante tres motores seleccionables de curaduría viral:
 - **Modo Nube Gemini (`gemini`, predeterminado):** Análisis multimodal directo tomando **Gemini 3.5 (`gemini-3.5-flash-lite`) como modelo predeterminado oficial** (`MODELOS_CANDIDATOS[0]`), con cascada automática ante errores 429 hacia `gemini-3.8-flash` y `gemini-3.7-flash`, segmentación paralela (`ThreadPoolExecutor(max_workers=3)`) y renderizado en **2 pasadas con micro-alineación fonética**.
-- **Modo Groq Nube (`groq`):** Transcripción delegada a la nube vía Groq Audio API (`whisper-large-v3-turbo`) con timestamps por palabra y segmento, división automática sin recodificar si supera 24 MB, picos vocales RMS y curaduría viral en Groq Cloud API (`llama-3.3-70b-versatile` / modelos Groq) con renderizado en **1 sola pasada directa** y respaldo automático a Whisper local ante fallo de red o cuota `429`.
+- **Modo Groq Nube (`groq`):** Transcripción delegada a la nube vía Groq Audio API (`whisper-large-v3-turbo`) con timestamps por palabra y segmento, división automática sin recodificar si supera 24 MB, picos vocales RMS y curaduría viral en Groq Cloud API mediante cascada ordenada de modelos activos (`GROQ_MODELOS_CANDIDATOS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]`) con rotación automática ante `404`/`429`, limpieza de `<think>` para Qwen 3, protección WAF vía `User-Agent: Mozilla/5.0 (X11; Linux x86_64) KicksazosStudio/5.0`, renderizado en **1 sola pasada directa** y respaldo automático a Whisper/Ollama local ante fallo de red o cuota `429`.
 - **Modo Local 100% Offline (`local`):** Transcripción local `faster-whisper` (`medium`, `int8`, CPU) + detección RMS de picos + **Ollama** (`127.0.0.1:11434`) + subtítulos `word_timestamps` y renderizado FFmpeg en **1 sola pasada directa**.
 
 ### 1.2 Hardware del Host y Entorno Operativo
@@ -352,7 +352,7 @@ def _construir_prompt_ollama(transcripcion_bloque: str, duracion_bloque: float) 
 
 ### 3.2 Configuración del Modo Nube (`gemini` y `groq`)
 - **Cascada de Modelos Gemini (Gemini 3.5 predeterminado):** `MODELOS_CANDIDATOS = ['gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.7-flash']` (`MODELO_GEMINI_PREDETERMINADO = 'gemini-3.5-flash-lite'`).
-- **Groq Nube (`groq`):** Transcripción local Whisper + API Groq OpenAI-compatible (`llama-3.3-70b-versatile`) con fallback automático a Ollama ante 429.
+- **Groq Nube (`groq`):** Transcripción en nube Groq Whisper (`whisper-large-v3-turbo`) + API Groq OpenAI-compatible con cascada ordenada de modelos activos (`GROQ_MODELOS_CANDIDATOS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]`). Salto inmediato ante errores HTTP 404 (`model_not_found`) o 429 (cuota) hacia el siguiente modelo candidato antes de conmutar a respaldo local (`respaldo_local_auto`). Limpieza automática de etiquetas `<think>[\s\S]*?</think>` en respuestas de Qwen 3 y protección anti-bloqueo WAF con `User-Agent: Mozilla/5.0 (X11; Linux x86_64) KicksazosStudio/5.0` en todas las peticiones a `api.groq.com`.
 - **Parámetros de Inferencia:** `temperature=0.20`, `HttpOptions.timeout = 600_000` ms (10 minutos).
 - **Chunking Paralelo:** Si el audio supera los 30 minutos (`> 1800 s`), `_segmentar_audio_en_chunks()` divide el archivo con `ffmpeg -c copy` en bloques de 25 minutos (`1500 s`) con `60 s` de solapamiento. Los bloques se procesan concurrentemente en un `ThreadPoolExecutor(max_workers=3)`.
 - **Deduplicación de Solapamientos:** `_deduplicar_clips_solapados()` detecta solapamientos `> 50%` entre clips de bloques adyacentes y resuelve la colisión mediante `_puntaje_calidad_clip()`, preservando el segmento con mayor duración, conteo de subtítulos y riqueza semántica.
@@ -533,6 +533,7 @@ Sustituye por completo a Gradio por una interfaz nativa **Dark Studio** (`Kicksa
 
 ### 5.3 Publicación Automatizada en YouTube Shorts (`subir_shorts.py`)
 - **Flujo OAuth 2.0 Headless:** Genera credenciales locales en `token.json` utilizando `InstalledAppFlow` con el scope estricto `https://www.googleapis.com/auth/youtube.upload`.
+- **Resolución Permanente de Caducidad (`token.json`):** Si el token expira cada 7 días, el administrador debe cambiar el estado de la App OAuth en **Google Cloud Console** (*APIs & Services > OAuth consent screen*) de *Testing* a **Producción** (*In Production*) para que los *refresh tokens* no caduquen semanalmente.
 - **Trazabilidad por Hash de Cuenta (`obtener_hash_cuenta`):** Genera un hash SHA-256 corto a partir del refresh token o client ID para etiquetar cada subida en `subidas_shorts.json` sin almacenar credenciales en texto plano.
 - **Auditoría de Cuota de 24 Horas Móviles (`verificar_cuota_diaria`):** Comprueba el número de subidas registradas en las 24 horas precedentes. Si `subidas_24h >= limite_diario (6)`, detiene nuevas peticiones y marca los clips restantes como `Pendiente por cuota diaria (6/24h)` para no quemar la cuota de la cuota del proyecto en Google Cloud Console.
 - **Subida Reanudable con Backoff y Jitter:** Realiza subidas resumables (`MediaFileUpload(chunksize=1024*1024, resumable=True)`) con 5 intentos de reintento exponencial aleatorizado ante errores de red `5xx`.
@@ -1080,7 +1081,7 @@ Resultado: **Ran 64 tests in 10.865s — OK (0 fallos, 0 errores)**.
 cd /home/bastiboy/clips_automation
 source venv/bin/activate
 
-# Verificación de sintaxis y suite completa de pruebas en modo Qt offscreen (77 tests)
+# Verificación de sintaxis y suite completa de pruebas en modo Qt offscreen (91 tests)
 venv/bin/python -m py_compile pipeline_viral_clips.py app_interfaz.py ui_desktop/*.py ui_desktop/widgets/*.py
 QT_QPA_PLATFORM=offscreen venv/bin/python -m unittest discover -s tests -v
 
@@ -1100,3 +1101,11 @@ venv/bin/python pipeline_viral_clips.py "/ruta/a/mi_video.mp4" --motor local --s
 # Iniciar Aplicación de Escritorio Nativa (Kicksazos Studio v5.0 PySide6)
 venv/bin/python app_interfaz.py
 ```
+
+---
+
+### Blindaje Groq Nube y Respaldo Local 16 GB RAM
+- **Segmentación Groq TPM/ITPM:** Bloques de `360s` (6 min) con `25s` de solapamiento y pausa preventiva `pausa_entre_bloques=8.0s` para respetar límites de `7K–8K TPM`.
+- **Continuidad por Bloque y Checkpoint:** Bucle externo por `idx_bloque` con persistencia incremental en `<job_dir>/groq_checkpoint.json`; ante `HTTP 429` extrae `try again in Xs` (<= 45s) y reintenta el mismo bloque hasta 2 veces antes de rotar de modelo sin reiniciar desde el bloque 1.
+- **Validación Temporal Dual y Payload Limpio:** Acepta timestamps relativos al bloque y absolutos del stream dentro de `[offset_inicio, offset_fin]`, maneja bloques vacíos (`[]`) sin error, omite `response_format` para evitar `HTTP 400 json_validate_failed` y limpia `<think>...</think>`.
+- **Respaldo Local Ollama 16 GB RAM:** Modelo por defecto ligero `qwen3:8b` (`MODELOS_LOCALES_OLLAMA = ["qwen3:8b", "gemma3:12b", "qwen2.5:7b", "qwen3:14b"]`) y timeout HTTP de `300s` en `_llamar_ollama_chat`.

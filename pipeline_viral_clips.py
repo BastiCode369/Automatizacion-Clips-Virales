@@ -61,14 +61,15 @@ MODELOS_CANDIDATOS = [
     "gemini-3.7-flash",
 ]
 MODELO_GEMINI_PREDETERMINADO = MODELOS_CANDIDATOS[0]
-MODELOS_GROQ = [
-    "llama-3.3-70b-versatile",
-    "qwen/qwen3-32b",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
+GROQ_MODELOS_CANDIDATOS = [
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-20b",
 ]
+MODELOS_GROQ = list(GROQ_MODELOS_CANDIDATOS)
 GROQ_MODELO_WHISPER = "whisper-large-v3-turbo"
 GROQ_AUDIO_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-MODELOS_LOCALES_OLLAMA = ["qwen3:14b", "gemma3:12b", "qwen2.5:14b"]
+MODELOS_LOCALES_OLLAMA = ["gemma3:12b", "qwen3:8b", "qwen2.5:7b", "qwen3:14b"]
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 WHISPER_MODEL_SIZE = "medium"
 RUTA_MARCA_AGUA = BASE_DIR / "assets" / "watermark.png"
@@ -314,7 +315,7 @@ class OllamaCircuitBreaker:
             self._opened_at = None
 
 
-OLLAMA_CIRCUIT_BREAKER = OllamaCircuitBreaker(failure_threshold=3, cooldown_seconds=30.0)
+OLLAMA_CIRCUIT_BREAKER = OllamaCircuitBreaker(failure_threshold=5, cooldown_seconds=45.0)
 
 
 def crear_contexto_job(url: str) -> JobContext:
@@ -2294,11 +2295,13 @@ def analizar_con_gemini(
                 )
                 _emitir_telemetria(on_telemetria, ultimo_ts_tele, datos_fin, forzar=True)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futuros = [
-                executor.submit(_procesar_bloque, idx_c, ruta_c, off_c, dur_c)
-                for idx_c, (ruta_c, off_c, dur_c) in enumerate(chunks, start=1)
-            ]
+        max_workers_gemini = 2 if "gemini-3.5-flash-lite" in str(modelo_efectivo) else 3
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_gemini) as executor:
+            futuros = []
+            for idx_c, (ruta_c, off_c, dur_c) in enumerate(chunks, start=1):
+                if idx_c > 1 and max_workers_gemini == 2:
+                    time.sleep(6.0)
+                futuros.append(executor.submit(_procesar_bloque, idx_c, ruta_c, off_c, dur_c))
             for fut in futuros:
                 fut.result()
 
@@ -3000,7 +3003,7 @@ def _llamar_ollama_chat(
         )
         partes_contenido: List[str] = []
         chars = 0
-        with urllib.request.urlopen(req, timeout=600.0) as resp:
+        with urllib.request.urlopen(req, timeout=300.0) as resp:
             for raw_line in resp:
                 linea = raw_line.decode("utf-8", errors="replace").strip()
                 if not linea:
@@ -3299,7 +3302,6 @@ def _llamar_groq_chat(
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.25,
-        "response_format": {"type": "json_object"},
     }
     req = urllib.request.Request(
         url,
@@ -3307,7 +3309,7 @@ def _llamar_groq_chat(
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "KicksazosStudio/5.0",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) KicksazosStudio/5.0",
         },
         method="POST",
     )
@@ -3429,7 +3431,7 @@ def _peticion_multipart_groq_whisper(
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "KicksazosStudio/5.0",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) KicksazosStudio/5.0",
         },
         method="POST",
     )
@@ -3645,6 +3647,7 @@ def analizar_con_groq(
     job_dir: Optional[Path | str] = None,
     groq_api_key: Optional[str] = None,
     respaldo_local_auto: bool = True,
+    pausa_entre_bloques: float = 8.0,
     on_log: Optional[Callable[[str], None]] = None,
     on_telemetria: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[dict]:
@@ -3711,84 +3714,225 @@ def analizar_con_groq(
         segmentos=segmentos,
         indices_picos=indices_picos,
         duracion_total=duracion_efectiva,
+        max_duracion_bloque=270.0,
+        solapamiento=25.0,
     )
     if not bloques:
         raise RuntimeError("No hay contenido transcrito suficiente para analizar con Groq.")
 
-    _log(f"\n[2/4] Curaduría viral en Groq Nube ({modelo_elegido}) en {len(bloques)} bloque(s)...")
-    ultimo_ts = [0.0]
+    # Cascada de modelos Groq
+    candidatos_groq = list(GROQ_MODELOS_CANDIDATOS)
+    if modelo_preferido and modelo_preferido not in MODELOS_CANDIDATOS:
+        if modelo_preferido in candidatos_groq:
+            candidatos_groq.remove(modelo_preferido)
+        candidatos_groq.insert(0, modelo_preferido)
+
+    ruta_ckpt_groq = dir_job / "groq_checkpoint.json"
+    ruta_state_groq = dir_job / "groq_state.json"
     clips_acumulados: List[dict] = []
+    ultimo_bloque_completado = 0
+    if ruta_ckpt_groq.exists():
+        try:
+            ckpt_data = json.loads(ruta_ckpt_groq.read_text(encoding="utf-8"))
+            if isinstance(ckpt_data, list):
+                clips_acumulados = list(ckpt_data)
+            elif isinstance(ckpt_data, dict):
+                clips_acumulados = list(ckpt_data.get("clips") or [])
+        except Exception:
+            clips_acumulados = []
+    if ruta_state_groq.exists():
+        try:
+            state_data = json.loads(ruta_state_groq.read_text(encoding="utf-8"))
+            if isinstance(state_data, dict):
+                ultimo_bloque_completado = int(state_data.get("ultimo_bloque") or 0)
+        except Exception:
+            ultimo_bloque_completado = 0
+
     total_b = len(bloques)
+    idx_modelo_activo = 0
+    modelo_elegido = candidatos_groq[idx_modelo_activo]
+    ultimo_ts = [0.0]
+
+    _log(f"\n[2/4] Curaduría viral en Groq Nube ({modelo_elegido}) en {total_b} bloque(s)...")
 
     for idx_b, bloque in enumerate(bloques, start=1):
+        if idx_b <= ultimo_bloque_completado:
+            continue
+
+        if idx_b > 1 and pausa_entre_bloques > 0.0:
+            time.sleep(pausa_entre_bloques)
+
         offset_seg = float(bloque["offset_seg"])
         dur_bloque = float(bloque["duracion_bloque"])
-        prompt = _construir_prompt_ollama(bloque["texto"], dur_bloque)
-
-        _emitir_telemetria(
-            on_telemetria,
-            ultimo_ts,
-            {
-                "etapa": "gemini",
-                "titulo_etapa": f"Curaduría Viral Groq ({modelo_elegido})",
-                "porcentaje": round(((idx_b - 1) / total_b) * 100.0, 1),
-                "bloque_actual": idx_b,
-                "bloques_completados": idx_b - 1,
-                "total_bloques": total_b,
-                "bloques_activos": [f"Bloque {idx_b}/{total_b}"],
-                "modelo_ia": modelo_elegido,
-                "eta": "--:--",
-                "detalle": f"Enviando transcripción bloque {idx_b}/{total_b} a Groq Cloud...",
-            },
-            forzar=True,
+        offset_fin = offset_seg + dur_bloque
+        rango_bloque_str = f"[{segundos_a_hhmmss(offset_seg)} - {segundos_a_hhmmss(offset_fin)}]"
+        prompt = (
+            f"Rango temporal exacto de este bloque en el stream: {rango_bloque_str}.\n"
+            + _construir_prompt_ollama(bloque["texto"], dur_bloque)
         )
+
+        texto_resp: Optional[str] = None
+        while idx_modelo_activo < len(candidatos_groq):
+            modelo_elegido = candidatos_groq[idx_modelo_activo]
+            _emitir_telemetria(
+                on_telemetria,
+                ultimo_ts,
+                {
+                    "etapa": "gemini",
+                    "titulo_etapa": f"Curaduría Viral Groq ({modelo_elegido})",
+                    "porcentaje": round(((idx_b - 1) / total_b) * 100.0, 1),
+                    "bloque_actual": idx_b,
+                    "bloques_completados": idx_b - 1,
+                    "total_bloques": total_b,
+                    "bloques_activos": [f"Bloque {idx_b}/{total_b}"],
+                    "modelo_ia": modelo_elegido,
+                    "eta": "--:--",
+                    "detalle": f"Enviando transcripción bloque {idx_b}/{total_b} a Groq Cloud ({modelo_elegido})...",
+                },
+                forzar=True,
+            )
+
+            reintentos_429 = 0
+            bloque_ok = False
+            while True:
+                try:
+                    texto_resp = _llamar_groq_chat(api_key, modelo_elegido, prompt)
+                    bloque_ok = True
+                    break
+                except urllib.error.HTTPError as err_http:
+                    detalle = ""
+                    try:
+                        detalle = err_http.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        detalle = str(err_http)
+
+                    if err_http.code == 429 and reintentos_429 < 2:
+                        headers_http = getattr(err_http, "headers", None)
+                        retry_after_raw = headers_http.get("retry-after") if headers_http else None
+                        segundos_sugeridos: Optional[float] = None
+                        if retry_after_raw is not None:
+                            try:
+                                segundos_sugeridos = float(str(retry_after_raw).strip())
+                            except ValueError:
+                                segundos_sugeridos = None
+                        if segundos_sugeridos is None:
+                            match_espera = re.search(r"try again in\s+([0-9.]+)s", detalle, re.IGNORECASE)
+                            if match_espera:
+                                segundos_sugeridos = float(match_espera.group(1))
+                        if segundos_sugeridos is None:
+                            segundos_sugeridos = 10.0 + (reintentos_429 * 5.0)
+                        if segundos_sugeridos <= 45.0:
+                            espera_s = min(max(segundos_sugeridos + 1.5, 8.0), 45.0)
+                            reintentos_429 += 1
+                            _log(
+                                f"[AVISO] Groq ({modelo_elegido}) TPM 429 en bloque {idx_b}/{total_b}; "
+                                f"esperando {espera_s:.1f}s (reintento {reintentos_429}/2)..."
+                            )
+                            time.sleep(espera_s)
+                            continue
+
+                    es_reintentable_cascada = (
+                        err_http.code in (400, 404, 429)
+                        or "model_not_found" in detalle.lower()
+                    )
+                    hay_siguiente_modelo = (idx_modelo_activo + 1) < len(candidatos_groq)
+                    if es_reintentable_cascada and hay_siguiente_modelo:
+                        siguiente_mod = candidatos_groq[idx_modelo_activo + 1]
+                        _log(
+                            f"[AVISO] Groq modelo {modelo_elegido} falló en bloque {idx_b}/{total_b} "
+                            f"con HTTP {err_http.code} ({detalle.strip()}); "
+                            f"conmutando a siguiente modelo candidato: {siguiente_mod}..."
+                        )
+                        idx_modelo_activo += 1
+                        break
+
+                    if err_http.code == 429:
+                        raise GeminiQuotaExhaustedError(
+                            f"Groq cuota 429 agotada ({modelo_elegido}): {detalle}"
+                        ) from err_http
+                    raise RuntimeError(
+                        f"Groq HTTP {err_http.code} ({modelo_elegido}): {detalle}"
+                    ) from err_http
+
+            if bloque_ok:
+                break
+
+        if texto_resp is None:
+            continue
+
+        texto_resp = re.sub(r"<think>[\s\S]*?</think>", "", texto_resp).strip()
 
         try:
-            texto_resp = _llamar_groq_chat(api_key, modelo_elegido, prompt)
-        except urllib.error.HTTPError as err_http:
-            detalle = ""
-            try:
-                detalle = err_http.read().decode("utf-8", errors="replace")
-            except Exception:
-                detalle = str(err_http)
-            if err_http.code == 429:
-                raise GeminiQuotaExhaustedError(f"Groq cuota 429 agotada ({modelo_elegido}): {detalle}") from err_http
-            raise RuntimeError(f"Groq HTTP {err_http.code} ({modelo_elegido}): {detalle}") from err_http
-
-        clips_bloque = _limpiar_y_parsear_json(
-            texto_resp,
-            duracion_total=dur_bloque,
-            permitir_vacio=(total_b > 1),
-        )
-        for clip in clips_bloque:
-            try:
-                ini_abs = max(0.0, hhmmss_a_segundos(clip["inicio"]) + offset_seg)
-                fin_abs = max(0.0, hhmmss_a_segundos(clip["fin"]) + offset_seg)
-            except (KeyError, ValueError, TypeError):
-                continue
-            if duracion_efectiva > 0.0:
-                if ini_abs >= duracion_efectiva - 2.0:
-                    continue
-                fin_abs = min(fin_abs, duracion_efectiva)
-            dur_clip_abs = fin_abs - ini_abs
-            if dur_clip_abs < 5.0:
-                continue
-
-            subs_whisper = _construir_subtitulos_desde_whisper(
-                palabras,
-                ini_abs,
-                fin_abs,
-                segmentos=segmentos,
+            clips_bloque = _limpiar_y_parsear_json(
+                texto_resp,
+                duracion_total=duracion_efectiva if duracion_efectiva > 0.0 else None,
+                permitir_vacio=True,
             )
-            clip_enriquecido = dict(clip)
-            clip_enriquecido["inicio"] = segundos_a_hhmmss(ini_abs)
-            clip_enriquecido["fin"] = segundos_a_hhmmss(fin_abs)
-            clip_enriquecido["duracion_segundos"] = int(round(dur_clip_abs))
-            clip_enriquecido["subtitulos"] = subs_whisper
-            clip_enriquecido["subtitulos_origen"] = "whisper_word_timestamps"
-            clip_enriquecido["motor_ia"] = "groq"
-            clip_enriquecido["modelo_ia"] = modelo_elegido
-            clips_acumulados.append(clip_enriquecido)
+            clips_antes = len(clips_acumulados)
+            for clip in clips_bloque:
+                try:
+                    ini_raw = hhmmss_a_segundos(clip["inicio"])
+                    fin_raw = hhmmss_a_segundos(clip["fin"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+
+                if offset_seg > 0.0:
+                    if (offset_seg - 5.0) <= ini_raw <= (offset_fin + 5.0):
+                        ini_abs = max(0.0, ini_raw)
+                        fin_abs = max(0.0, fin_raw)
+                    elif 0.0 <= ini_raw <= (dur_bloque + 5.0):
+                        ini_abs = max(0.0, ini_raw + offset_seg)
+                        fin_abs = max(0.0, fin_raw + offset_seg)
+                    else:
+                        continue
+                else:
+                    if 0.0 <= ini_raw <= (dur_bloque + 5.0):
+                        ini_abs = max(0.0, ini_raw)
+                        fin_abs = max(0.0, fin_raw)
+                    else:
+                        continue
+
+                if duracion_efectiva > 0.0:
+                    if ini_abs >= duracion_efectiva - 2.0:
+                        continue
+                    fin_abs = min(fin_abs, duracion_efectiva)
+                dur_clip_abs = fin_abs - ini_abs
+                if dur_clip_abs < 5.0:
+                    continue
+
+                subs_whisper = _construir_subtitulos_desde_whisper(
+                    palabras,
+                    ini_abs,
+                    fin_abs,
+                    segmentos=segmentos,
+                )
+                clip_enriquecido = dict(clip)
+                clip_enriquecido["inicio"] = segundos_a_hhmmss(ini_abs)
+                clip_enriquecido["fin"] = segundos_a_hhmmss(fin_abs)
+                clip_enriquecido["duracion_segundos"] = int(round(dur_clip_abs))
+                clip_enriquecido["subtitulos"] = subs_whisper
+                clip_enriquecido["subtitulos_origen"] = "whisper_word_timestamps"
+                clip_enriquecido["motor_ia"] = "groq"
+                clip_enriquecido["modelo_ia"] = modelo_elegido
+                clips_acumulados.append(clip_enriquecido)
+
+            if len(clips_acumulados) == clips_antes:
+                _log(f"[INFO] Bloque {idx_b}/{total_b} sin momentos virales detectados")
+
+            ruta_ckpt_groq.write_text(
+                json.dumps(clips_acumulados, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            ruta_state_groq.write_text(
+                json.dumps({"ultimo_bloque": idx_b}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            _log(
+                f"[AVISO] Groq ({modelo_elegido}) bloque {idx_b}/{total_b} "
+                f"omitido por error: {exc}"
+            )
+            continue
 
     clips_finales = _deduplicar_clips_solapados(clips_acumulados)
     if not clips_finales:
@@ -3796,6 +3940,12 @@ def analizar_con_groq(
 
     for idx_f, clip_f in enumerate(clips_finales, start=1):
         clip_f["id"] = idx_f
+
+    if ruta_state_groq.exists():
+        try:
+            ruta_state_groq.unlink()
+        except Exception:
+            pass
 
     _guardar_y_sincronizar_clips(clips_finales, job_dir=job_dir)
     _log(f"✓ Análisis Groq completado ({modelo_elegido}): {len(clips_finales)} clips guardados en clips.json")

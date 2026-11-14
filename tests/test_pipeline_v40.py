@@ -12,36 +12,25 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import gradio as gr
-
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import app_interfaz
 import pipeline_viral_clips as pvc
+from ui_desktop import services as ui_services
 
 
-def _cerrar_loops_gradio(*demos: object) -> None:
-    """Cierra instancias gr.Blocks y event loops asyncio huérfanos para evitar ResourceWarning."""
-    for demo_obj in (*demos, getattr(app_interfaz, "demo", None)):
-        if demo_obj is not None:
+def _cerrar_ventanas_qt(*ventanas: object) -> None:
+    """Cierra ventanas Qt creadas en pruebas y drena eventos pendientes."""
+    app = app_interfaz.crear_aplicacion([])
+    for win in ventanas:
+        if win is not None:
             try:
-                demo_obj.close()
+                win.close()
             except Exception:
                 pass
-
-    try:
-        asyncio.set_event_loop(None)
-    except Exception:
-        pass
-
-    for obj in list(gc.get_objects()):
-        try:
-            if isinstance(obj, asyncio.AbstractEventLoop) and not obj.is_closed() and not obj.is_running():
-                obj.close()
-        except Exception:
-            pass
+    app.processEvents()
     gc.collect()
 
 
@@ -194,6 +183,7 @@ class TestTarea2ChunkingYGeminiParalelo(unittest.TestCase):
                 resultado = pvc.analizar_con_gemini(
                     audio,
                     duracion_total=3300.0,
+                    modelo_preferido="gemini-3.8-flash",
                     job_dir=tmp_dir,
                     on_log=lambda _: None,
                     on_telemetria=lambda d: telemetrias.append(dict(d)),
@@ -965,17 +955,17 @@ class TestTarea5CancelacionYLimpieza(unittest.TestCase):
 
 class TestTarea6InterfazCommandCenterYEstadisticas(unittest.TestCase):
     def setUp(self):
-        self._demos_creados = []
+        self._ventanas_creadas = []
 
     def tearDown(self):
-        _cerrar_loops_gradio(*self._demos_creados)
-        self._demos_creados.clear()
+        _cerrar_ventanas_qt(*self._ventanas_creadas)
+        self._ventanas_creadas.clear()
 
     @classmethod
     def tearDownClass(cls):
-        _cerrar_loops_gradio()
+        _cerrar_ventanas_qt()
 
-    def test_calcular_estadisticas_sistema_y_panel_html_offline(self):
+    def test_calcular_estadisticas_sistema_y_vistas_offline(self):
         from datetime import datetime, timedelta
 
         ahora = datetime.now().astimezone()
@@ -986,8 +976,13 @@ class TestTarea6InterfazCommandCenterYEstadisticas(unittest.TestCase):
             tmp_dir = Path(tmp)
             carpeta_jobs = tmp_dir / "jobs"
             carpeta_jobs.mkdir()
+            carpeta_salida = tmp_dir / "clips_finales"
+            carpeta_salida.mkdir()
             ruta_clips_raiz = tmp_dir / "clips.json"
             ruta_subidas = tmp_dir / "subidas_shorts.json"
+
+            mp4_clip1 = carpeta_salida / "clip1.mp4"
+            mp4_clip1.write_bytes(b"fake_mp4")
 
             job1_clips = [
                 {
@@ -997,7 +992,7 @@ class TestTarea6InterfazCommandCenterYEstadisticas(unittest.TestCase):
                     "fin": "00:01:30",
                     "duracion_segundos": 30,
                     "render_status": "OK",
-                    "archivo_local": "clip_1.mp4",
+                    "archivo_local": str(mp4_clip1),
                     "youtube_id": "yt_1",
                 },
                 {
@@ -1033,10 +1028,7 @@ class TestTarea6InterfazCommandCenterYEstadisticas(unittest.TestCase):
             job2_dir.mkdir()
             (job2_dir / "clips.json").write_text(json.dumps(job2_clips), encoding="utf-8")
 
-            # Carpeta sin clips.json debe contarse en total_carpetas_jobs pero no en total_jobs
             (carpeta_jobs / "20260403_000000_youtube_com_sin_clips").mkdir()
-
-            # Mirror raíz duplicado de job1 NO debe inflar el conteo total
             ruta_clips_raiz.write_text(json.dumps(job1_clips), encoding="utf-8")
 
             subidas_mock = [
@@ -1059,147 +1051,42 @@ class TestTarea6InterfazCommandCenterYEstadisticas(unittest.TestCase):
             ]
             ruta_subidas.write_text(json.dumps(subidas_mock), encoding="utf-8")
 
-            with patch.object(app_interfaz, "CARPETA_JOBS", carpeta_jobs), patch.object(
-                app_interfaz, "ARCHIVO_CLIPS", ruta_clips_raiz
-            ), patch.object(app_interfaz, "ARCHIVO_SUBIDAS", ruta_subidas):
-                stats = app_interfaz.calcular_estadisticas_sistema()
+            with patch.object(ui_services, "CARPETA_JOBS", carpeta_jobs), patch.object(
+                ui_services, "CARPETA_SALIDA", carpeta_salida
+            ), patch.object(ui_services, "ARCHIVO_CLIPS", ruta_clips_raiz), patch.object(
+                ui_services, "ARCHIVO_SUBIDAS", ruta_subidas
+            ):
+                stats = ui_services.calcular_estadisticas_sistema()
+                cuota = ui_services.consultar_cuota_diaria()
 
-            self.assertEqual(stats["total_jobs"], 2)
-            self.assertEqual(stats["total_carpetas_jobs"], 3)
-            self.assertEqual(stats["total_clips"], 4)
-            self.assertEqual(stats["total_subidos_youtube"], 3)
-            self.assertEqual(stats["total_programados_youtube"], 1)
+                app = app_interfaz.crear_aplicacion([])
+                ventana = app_interfaz.KicksazosMainWindow(auto_probe=False)
+                self._ventanas_creadas.append(ventana)
+                ventana.vista_stats_dashboard.recargar_datos()
+                ventana.vista_history_quota.recargar_datos()
+                app.processEvents()
+
+                self.assertEqual(ventana.vista_stats_dashboard.kpi_curados.lbl_valor.text(), "4")
+                self.assertEqual(ventana.vista_stats_dashboard.kpi_subidos.lbl_valor.text(), "3")
+                self.assertEqual(ventana.vista_history_quota.bar_cuota.value(), 2)
+
+            self.assertEqual(stats["total_jobs"], 3)
+            self.assertEqual(stats["clips_curados"], 4)
+            self.assertEqual(stats["clips_renderizados"], 1)
+            self.assertEqual(stats["shorts_subidos"], 3)
             self.assertEqual(stats["duracion_promedio_s"], 48.8)
-            self.assertEqual(stats["clips_optimos_shorts"], 1)
-            self.assertEqual(stats["cuota_usada_24h"], 2)
-            self.assertEqual(stats["cuota_limite_24h"], 6)
-            self.assertEqual(stats["cupo_disponible_24h"], 4)
             self.assertEqual(
                 stats["distribucion_duracion"],
-                {
-                    "cortos_lt_22": 1,
-                    "shorts_optimo_22_45": 1,
-                    "arcos_tiktok_46_75": 1,
-                    "largos_gt_75": 1,
-                },
+                {"<22s": 1, "22-45s": 1, "46-75s": 1, ">75s": 1},
             )
-            origenes = [item["origen"] for item in stats["actividad_reciente"]]
-            self.assertIn("Kick · westcol", origenes)
-            self.assertIn("Twitch · elxokas", origenes)
+            self.assertEqual(cuota["subidas_24h"], 2)
+            self.assertEqual(cuota["restantes"], 4)
 
-            stats_xss = dict(stats)
-            stats_xss["actividad_reciente"] = [
-                {
-                    "job_id": "xss_job",
-                    "fecha": "<script>alert(1)</script>",
-                    "origen": '"><img src=x onerror=alert(1)>',
-                    "clips": 2,
-                    "renderizados": 2,
-                    "subidos": 1,
-                    "duracion_promedio_s": 30.0,
-                }
-            ]
-            html_stats = app_interfaz.construir_panel_estadisticas_html(stats_xss)
-            self.assertNotIn("<script>alert(1)</script>", html_stats)
-            self.assertNotIn("<img src=x", html_stats)
-            self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html_stats)
-            self.assertIn("&quot;&gt;&lt;img src=x onerror=alert(1)&gt;", html_stats)
-            self.assertIn("48.8s", html_stats)
-            self.assertIn("Shorts Óptimo (22–45s)", html_stats)
+    def test_normalizar_telemetria_desktop_workers_y_cierre_limpio(self):
+        idle = ui_services.normalizar_estado_telemetria(None)
+        self.assertEqual(idle["etapa_num"], 0)
+        self.assertEqual(idle["etapa_nombre"], "En espera")
 
-    def test_construir_panel_telemetria_html_stepper_workers_y_xss(self):
-        html_idle = app_interfaz.construir_panel_telemetria_html(None)
-        for paso in ("1. Red &amp; Audio", "2. IA Paralela", "3. Render VAAPI", "4. YouTube Shorts"):
-            self.assertIn(paso, html_idle)
-
-        estado_gemini = {
-            "fase": "gemini",
-            "progreso": 0.40,
-            "mensaje": "Curando bloques paralelos",
-            "modelo": "gemini-2.5-flash",
-            "telemetria": {
-                "etapa": "gemini",
-                "porcentaje": 33.3,
-                "bloques_completados": 1,
-                "total_bloques": 3,
-                "bloques_activos": ["Bloque 2/3", "Bloque 3/3"],
-                "clips_activos": [],
-                "velocidad_red": "--",
-                "fps": "--",
-                "velocidad_render": "--",
-                "eta": "00:42",
-                "encoder": "Gemini File API",
-                "modelo_ia": "gemini-2.5-flash",
-                "detalle": "Procesando bloques concurrentes",
-            },
-        }
-        html_gemini = app_interfaz.construir_panel_telemetria_html(estado_gemini)
-        self.assertIn("Bloques: 1/3", html_gemini)
-        self.assertIn("Bloque 2/3", html_gemini)
-        self.assertIn("Bloque 3/3", html_gemini)
-        self.assertIn("IA Paralela", html_gemini)
-        self.assertIn("33.3%", html_gemini)
-
-        estado_render = {
-            "fase": "render",
-            "progreso": 0.72,
-            "mensaje": "Renderizando clips concurrentes",
-            "telemetria": {
-                "etapa": "render",
-                "porcentaje": 62.5,
-                "bloques_completados": 3,
-                "total_bloques": 3,
-                "bloques_activos": [],
-                "clips_activos": [
-                    {"clip_id": 1, "porcentaje": 62.5, "fps": "95.0", "velocidad_render": "3.2x"},
-                    {"clip_id": 2, "porcentaje": 40.0, "fps": "88.0", "velocidad_x": "2.9x"},
-                ],
-                "velocidad_red": "--",
-                "fps": "95.0",
-                "velocidad_render": "3.2x",
-                "eta": "00:14",
-                "encoder": "h264_vaapi",
-                "clip_indice": 1,
-                "total_clips": 2,
-                "clip_id": 1,
-                "detalle": "Quemando subtítulos ASS",
-            },
-        }
-        html_render = app_interfaz.construir_panel_telemetria_html(estado_render)
-        self.assertIn("Clip #1 (62% • 3.2x • 95.0 FPS)", html_render)
-        self.assertIn("Clip #2 (40% • 2.9x • 88.0 FPS)", html_render)
-        self.assertIn("AMD VAAPI", html_render)
-        self.assertIn("95.0 FPS", html_render)
-        self.assertIn("3.2x", html_render)
-        self.assertIn("00:14", html_render)
-
-        estado_xss = {
-            "fase": "render",
-            "progreso": 0.5,
-            "mensaje": '<script>alert("msg")</script>',
-            "telemetria": {
-                "etapa": "render",
-                "porcentaje": 50.0,
-                "bloques_completados": 1,
-                "total_bloques": 2,
-                "bloques_activos": ['<img src=x onerror=alert("b")>'],
-                "clips_activos": [{"clip_id": '<script>c</script>', "estado": '"><svg onload=alert(1)>'}],
-                "velocidad_red": '<script>net</script>',
-                "fps": '<script>fps</script>',
-                "velocidad_render": '<script>vel</script>',
-                "eta": '"><script>eta</script>',
-                "encoder": '<script>enc</script>',
-                "modelo_ia": '<script>mod</script>',
-                "detalle": '<img src=x onerror=alert("det")>',
-            },
-        }
-        html_xss = app_interfaz.construir_panel_telemetria_html(estado_xss)
-        for peligro in ("<script>", "<img src=x", "<svg onload"):
-            self.assertNotIn(peligro, html_xss)
-        self.assertIn("&lt;script&gt;alert(&quot;msg&quot;)&lt;/script&gt;", html_xss)
-        self.assertIn("&lt;img src=x onerror=alert(&quot;det&quot;)&gt;", html_xss)
-
-    def test_integracion_telemetria_v40_a_gradio_sin_keyerror_y_cierre_limpio(self):
         estados_v40 = [
             {
                 "fase": "audio",
@@ -1223,7 +1110,7 @@ class TestTarea6InterfazCommandCenterYEstadisticas(unittest.TestCase):
             {
                 "fase": "gemini",
                 "progreso": 0.35,
-                "mensaje": "IA Paralela v4.0",
+                "mensaje": "IA Paralela",
                 "telemetria": {
                     "etapa": "gemini",
                     "bloques_completados": 2,
@@ -1237,7 +1124,7 @@ class TestTarea6InterfazCommandCenterYEstadisticas(unittest.TestCase):
                     "velocidad_x": "--",
                     "eta": "00:25",
                     "encoder": "Gemini File API",
-                    "modelo_ia": "gemini-2.5-flash",
+                    "modelo_ia": pvc.MODELOS_CANDIDATOS[0],
                 },
             },
             {
@@ -1267,20 +1154,12 @@ class TestTarea6InterfazCommandCenterYEstadisticas(unittest.TestCase):
             {
                 "fase": "completado",
                 "progreso": 1.0,
-                "mensaje": "Pipeline v4.0 finalizado",
+                "mensaje": "Pipeline finalizado",
                 "clips": [],
                 "ultimo_video": None,
                 "telemetria": {
                     "etapa": "completado",
-                    "bloques_completados": 3,
-                    "total_bloques": 3,
-                    "bloques_activos": [],
-                    "clips_activos": [],
                     "porcentaje": 100.0,
-                    "velocidad_red": "--",
-                    "fps": "--",
-                    "velocidad_render": "--",
-                    "velocidad_x": "--",
                     "eta": "00:00",
                     "encoder": "h264_vaapi",
                     "detalle": "Completado",
@@ -1288,50 +1167,32 @@ class TestTarea6InterfazCommandCenterYEstadisticas(unittest.TestCase):
             },
         ]
 
-        with patch.object(app_interfaz, "ejecutar_pipeline_completo", return_value=iter(estados_v40)), patch.object(
-            app_interfaz, "obtener_datos_galeria", return_value=([], None, "<div>ok</div>", [])
-        ), patch.object(app_interfaz, "obtener_tabla_historial", return_value=([], "<div>hist</div>")):
-            salidas = list(
-                app_interfaz.ejecutar_pipeline_gradio(
-                    url="https://kick.com/westcol/videos/999",
-                    modelo_preferido="Auto (Recomendado)",
-                    subir_auto_yt=False,
-                    solo_analisis=False,
-                    gemini_key="",
-                    progress=None,
-                )
-            )
+        norm_list = [ui_services.normalizar_estado_telemetria(e) for e in estados_v40]
+        self.assertEqual(norm_list[0]["velocidad"], "14.2MiB/s")
+        self.assertEqual(norm_list[1]["chunks_completados"], 2)
+        self.assertEqual(norm_list[1]["chunks_total"], 3)
+        self.assertEqual(len(norm_list[1]["workers"]), 1)
+        self.assertEqual(norm_list[2]["fps"], "104.2")
+        self.assertEqual(norm_list[2]["velocidad"], "3.5x")
+        self.assertEqual(norm_list[2]["eta"], "00:09")
+        self.assertEqual(norm_list[2]["encoder"], "h264_vaapi")
+        self.assertTrue(norm_list[3]["completado"])
 
-        self.assertEqual(len(salidas), 4)
-        for fila in salidas:
-            self.assertEqual(len(fila), 9)
-        self.assertIn("14.2MiB/s", salidas[0][1])
-        self.assertIn("Bloques: 2/3", salidas[1][1])
-        self.assertIn("Bloque 3/3", salidas[1][1])
-        self.assertIn("Clip #1 (80% • 3.5x • 104.2 FPS)", salidas[2][1])
-        self.assertIn("00:09", salidas[2][1])
-        self.assertIn("AMD VAAPI", salidas[2][1])
+        app = app_interfaz.crear_aplicacion([])
+        ventana = app_interfaz.KicksazosMainWindow(auto_probe=False)
+        self._ventanas_creadas.append(ventana)
+        self.assertEqual(ventana.stack_vistas.count(), 5)
 
-        skip_marker = gr.skip()
-        self.assertEqual(salidas[0][6], "<div>ok</div>")
-        self.assertEqual(salidas[0][8], "<div>hist</div>")
-        for idx_tick in (1, 2):
-            for idx_col in range(3, 9):
-                self.assertEqual(salidas[idx_tick][idx_col], skip_marker)
-        self.assertEqual(salidas[3][6], "<div>ok</div>")
-        self.assertEqual(salidas[3][8], "<div>hist</div>")
+        cc = ventana.vista_command_center
+        for est in estados_v40:
+            cc.actualizar_telemetria(est)
+        self.assertEqual(cc.bar_global.value(), 100)
+        self.assertEqual(cc.kpi_encoder.lbl_valor.text(), "h264_vaapi")
 
-        demo = app_interfaz.construir_interfaz()
-        self._demos_creados.append(demo)
-        self.assertIsInstance(demo, gr.Blocks)
-        tabs = [
-            comp.label
-            for comp in demo.blocks.values()
-            if isinstance(comp, gr.Tab)
-        ]
-        self.assertEqual(len(tabs), 4)
-        self.assertIn("⚡ 1. Centro de Mando", tabs)
-        self.assertIn("📊 4. Estadísticas & Rendimiento", tabs)
+        nav_labels = [ventana.sidebar_nav.item(i).text() for i in range(ventana.sidebar_nav.count())]
+        self.assertEqual(len(nav_labels), 5)
+        self.assertIn("⚡ Centro de Mando", nav_labels)
+        self.assertIn("📊 Estadísticas", nav_labels)
 
 
 if __name__ == "__main__":

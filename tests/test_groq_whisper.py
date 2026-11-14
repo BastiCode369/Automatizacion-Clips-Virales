@@ -36,6 +36,9 @@ class _FakeHTTPResponse:
     def read(self) -> bytes:
         return self._bytes
 
+    def __iter__(self):
+        return iter(self._bytes.splitlines(keepends=True))
+
     def __enter__(self):
         return self
 
@@ -86,6 +89,7 @@ class TestGroqWhisper(unittest.TestCase):
             req = mock_urlopen.call_args[0][0]
             self.assertIn("Authorization", req.headers)
             self.assertEqual(req.headers["Authorization"], "Bearer gsk_test123")
+            self.assertEqual(req.headers["User-agent"], "Mozilla/5.0 (X11; Linux x86_64) KicksazosStudio/5.0")
             self.assertIn("multipart/form-data; boundary=", req.headers["Content-type"])
 
             body_bytes = req.data
@@ -353,6 +357,378 @@ class TestGroqWhisper(unittest.TestCase):
         linea_cli = pvc._formatear_barra_cli(estado_tele)
         self.assertIn("Groq Whisper", linea_cli)
         self.assertIn("Parte 1/2", linea_cli)
+
+    def test_cascada_modelos_groq_y_user_agent_chat(self) -> None:
+        """Valida la cascada openai/gpt-oss-120b -> qwen/qwen3.8-27b ante error 404/429, User-Agent y limpieza <think>."""
+        mock_transcript = {
+            "duracion": 20.0,
+            "duracion_total": 20.0,
+            "idioma": "es",
+            "segmentos": [
+                {"start": 0.0, "end": 10.0, "text": "Clip de streaming en Kick", "pico_vocal": True}
+            ],
+            "palabras": [
+                {"word": "Clip", "start": 0.0, "end": 1.0},
+                {"word": "streaming", "start": 1.1, "end": 3.0},
+            ],
+            "indices_picos": [0],
+        }
+
+        # Simular que openai/gpt-oss-120b falla con 404 (model_not_found)
+        err_404 = urllib.error.HTTPError(
+            url="https://api.groq.com/openai/v1/chat/completions",
+            code=404,
+            msg="Not Found",
+            hdrs=MagicMock(),
+            fp=io.BytesIO(b'{"error": {"message": "model_not_found: openai/gpt-oss-120b"}}'),
+        )
+
+        # qwen/qwen3.8-27b responde con bloque <think>
+        mock_curaduria_qwen = (
+            "<think>Razonamiento interno del modelo Qwen3...</think>\n"
+            + json.dumps({
+                "clips": [
+                    {
+                        "inicio": "00:00:00",
+                        "fin": "00:00:08",
+                        "titulo": "Cascada Exitosa Qwen3",
+                        "justificacion": "Alta energía detectada tras fallback",
+                        "hook": "Mira esto",
+                        "score_viral": 92,
+                    }
+                ]
+            })
+        )
+
+        modelos_llamados = []
+        headers_capturados = []
+
+        def fake_llamar_chat(api_key, modelo, prompt):
+            modelos_llamados.append(modelo)
+            if modelo == "openai/gpt-oss-120b":
+                raise err_404
+            return mock_curaduria_qwen
+
+        logs = []
+        with patch.object(pvc, "_transcribir_audio_groq", return_value=mock_transcript), \
+             patch.object(pvc, "_llamar_groq_chat", side_effect=fake_llamar_chat), \
+             patch.object(pvc, "GROQ_MODELOS_CANDIDATOS", ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]):
+
+            clips = pvc.analizar_con_groq(
+                str(self.fake_audio),
+                modelo_preferido="openai/gpt-oss-120b",
+                job_dir=self.job_dir,
+                groq_api_key="gsk_test",
+                on_log=logs.append,
+            )
+
+            # Debe haber intentado gpt-oss-120b, saltado por 404, y tenido éxito con qwen3.8-27b
+            self.assertEqual(modelos_llamados, ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"])
+            self.assertEqual(len(clips), 1)
+            self.assertEqual(clips[0]["modelo_ia"], "qwen/qwen3.8-27b")
+            self.assertEqual(clips[0]["titulo"], "Cascada Exitosa Qwen3")
+            self.assertTrue(any("conmutando a siguiente modelo candidato" in l for l in logs))
+
+        # Test directo de _llamar_groq_chat para verificar el header User-Agent en peticiones a api.groq.com
+        chat_mock_resp = {
+            "choices": [
+                {"message": {"content": '{"clips": []}'}}
+            ]
+        }
+        with patch("urllib.request.urlopen", return_value=_FakeHTTPResponse(chat_mock_resp)) as mock_urlopen:
+            pvc._llamar_groq_chat(
+                api_key="gsk_test456",
+                modelo_groq="openai/gpt-oss-120b",
+                prompt="test prompt",
+            )
+            req = mock_urlopen.call_args[0][0]
+            self.assertIn("User-agent", req.headers)
+            self.assertEqual(req.headers["User-agent"], "Mozilla/5.0 (X11; Linux x86_64) KicksazosStudio/5.0")
+            self.assertEqual(req.headers["Authorization"], "Bearer gsk_test456")
+
+    def test_analizar_con_groq_bloque_vacio_y_fallido_continua_sin_abortar(self) -> None:
+        """Bloque 1/3 vacío ([]) y bloque 2/3 con JSON inválido no abortan el job; continúa a 3/3 y guarda checkpoint."""
+        transcripcion_mock = {
+            "duracion": 1800.0,
+            "segmentos": [{"inicio": 0.0, "fin": 10.0, "texto": "Intro del stream"}],
+            "palabras": [],
+            "indices_picos": [],
+        }
+        bloques_mock = [
+            {"offset_seg": 0.0, "duracion_bloque": 600.0, "texto": "Bloque 1"},
+            {"offset_seg": 600.0, "duracion_bloque": 600.0, "texto": "Bloque 2"},
+            {"offset_seg": 1200.0, "duracion_bloque": 600.0, "texto": "Bloque 3"},
+        ]
+        respuestas = iter(
+            [
+                "[]",  # Bloque 1/3 vacío
+                "NO_ES_JSON_VALIDO{{{",  # Bloque 2/3 corrupto
+                json.dumps(
+                    [
+                        {
+                            "titulo": "Clip Bloque 3",
+                            "inicio": "00:00:10",
+                            "fin": "00:00:35",
+                            "gancho": "Qué locura parce",
+                            "razon_viral": "Clímax",
+                        }
+                    ]
+                ),
+            ]
+        )
+        logs: list[str] = []
+
+        with (
+            patch.object(pvc, "_transcribir_audio_groq", return_value=transcripcion_mock),
+            patch.object(pvc, "_segmentar_transcripcion_para_ollama", return_value=bloques_mock),
+            patch.object(pvc, "_llamar_groq_chat", side_effect=lambda *_a, **_kw: next(respuestas)),
+        ):
+            clips = pvc.analizar_con_groq(
+                ruta_audio=str(self.fake_audio),
+                modelo_preferido="openai/gpt-oss-120b",
+                duracion_total=1800.0,
+                job_dir=self.job_dir,
+                groq_api_key="gsk_test_ok",
+                on_log=logs.append,
+            )
+
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(clips[0]["titulo"], "Clip Bloque 3")
+        # Bloque 3 tiene offset_seg=1200 -> 00:20:10 a 00:20:35
+        self.assertEqual(clips[0]["inicio"], "00:20:10")
+        self.assertEqual(clips[0]["fin"], "00:20:35")
+        self.assertTrue(any("bloque 2/3 omitido por error" in l for l in logs))
+        ckpt = self.job_dir / "groq_checkpoint.json"
+        self.assertTrue(ckpt.exists())
+        ckpt_data = json.loads(ckpt.read_text(encoding="utf-8"))
+        self.assertEqual(len(ckpt_data), 1)
+
+    def test_analizar_con_groq_timestamps_absolutos_y_relativos(self) -> None:
+        """Acepta timestamps absolutos dentro de [offset_seg, offset_fin + 5] y los valida contra duracion_total_stream."""
+        transcripcion_mock = {
+            "duracion": 1500.0,
+            "segmentos": [{"inicio": 600.0, "fin": 650.0, "texto": "Momento épico"}],
+            "palabras": [],
+            "indices_picos": [],
+        }
+        bloques_mock = [
+            {"offset_seg": 600.0, "duracion_bloque": 600.0, "texto": "Bloque 2 absoluto"},
+        ]
+        resp_abs = json.dumps(
+            [
+                {
+                    "titulo": "Clip Absoluto",
+                    "inicio": "00:11:10",  # 670s (absoluto dentro de [600, 1205])
+                    "fin": "00:11:40",     # 700s
+                    "gancho": "Parce mire esto",
+                    "razon_viral": "Reacción",
+                }
+            ]
+        )
+
+        with (
+            patch.object(pvc, "_transcribir_audio_groq", return_value=transcripcion_mock),
+            patch.object(pvc, "_segmentar_transcripcion_para_ollama", return_value=bloques_mock),
+            patch.object(pvc, "_llamar_groq_chat", return_value=resp_abs),
+        ):
+            clips = pvc.analizar_con_groq(
+                ruta_audio=str(self.fake_audio),
+                modelo_preferido="qwen/qwen3.8-27b",
+                duracion_total=1500.0,
+                job_dir=self.job_dir,
+                groq_api_key="gsk_test_abs",
+            )
+
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(clips[0]["inicio"], "00:11:10")
+        self.assertEqual(clips[0]["fin"], "00:11:40")
+        self.assertEqual(clips[0]["duracion_segundos"], 30)
+
+    def test_groq_429_espera_dinamica_y_reintento_mismo_bloque(self) -> None:
+        """Verifica parsing de 'Please try again in 8.16s' en HTTP 429 con espera y reintento en el mismo bloque."""
+        transcripcion_mock = {
+            "duracion": 300.0,
+            "segmentos": [{"start": 0.0, "end": 10.0, "text": "Clip uno"}],
+            "palabras": [],
+            "indices_picos": [],
+        }
+        bloques_mock = [{"offset_seg": 0.0, "duracion_bloque": 300.0, "texto": "[00:00:00] Clip uno"}]
+        resp_ok = json.dumps({
+            "clips": [{"inicio": "00:00:05", "fin": "00:00:25", "titulo": "Clip 429 OK"}]
+        })
+        err_429 = urllib.error.HTTPError(
+            url="https://api.groq.com/openai/v1/chat/completions",
+            code=429,
+            msg="Too Many Requests",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":{"message":"Rate limit reached. Please try again in 8.16s"}}'),
+        )
+
+        with (
+            patch.object(pvc, "_transcribir_audio_groq", return_value=transcripcion_mock),
+            patch.object(pvc, "_segmentar_transcripcion_para_ollama", return_value=bloques_mock),
+            patch.object(pvc, "_llamar_groq_chat", side_effect=[err_429, resp_ok]) as mock_chat,
+            patch("time.sleep") as mock_sleep,
+        ):
+            clips = pvc.analizar_con_groq(
+                ruta_audio=str(self.fake_audio),
+                duracion_total=300.0,
+                job_dir=self.job_dir,
+                groq_api_key="gsk_test_429",
+                pausa_entre_bloques=0.0,
+            )
+
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(mock_chat.call_count, 2)
+        self.assertEqual(mock_chat.call_args_list[0][0][1], mock_chat.call_args_list[1][0][1])
+        mock_sleep.assert_called_once()
+        self.assertAlmostEqual(mock_sleep.call_args[0][0], 9.66, places=2)
+
+    def test_groq_continuidad_por_bloque_y_checkpoint(self) -> None:
+        """Verifica continuidad exacta desde idx_bloque sin reiniciar en bloque 1 y persistencia en groq_checkpoint.json."""
+        transcripcion_mock = {
+            "duracion": 720.0,
+            "segmentos": [{"start": 0.0, "end": 10.0, "text": "Texto"}],
+            "palabras": [],
+            "indices_picos": [],
+        }
+        bloques_mock = [
+            {"offset_seg": 0.0, "duracion_bloque": 360.0, "texto": "[00:00:00] Bloque 1"},
+            {"offset_seg": 335.0, "duracion_bloque": 360.0, "texto": "[00:00:00] Bloque 2"},
+        ]
+        resp_b1 = json.dumps({"clips": [{"inicio": "00:00:10", "fin": "00:00:30", "titulo": "Clip B1"}]})
+        resp_b2 = json.dumps({"clips": [{"inicio": "00:00:15", "fin": "00:00:35", "titulo": "Clip B2"}]})
+        err_404 = urllib.error.HTTPError(
+            url="https://api.groq.com/openai/v1/chat/completions",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":{"message":"model_not_found"}}'),
+        )
+
+        llamadas = []
+
+        def fake_chat(api_key, modelo, prompt):
+            llamadas.append(modelo)
+            if len(llamadas) == 1:
+                return resp_b1
+            if len(llamadas) == 2:
+                raise err_404
+            return resp_b2
+
+        with (
+            patch.object(pvc, "_transcribir_audio_groq", return_value=transcripcion_mock),
+            patch.object(pvc, "_segmentar_transcripcion_para_ollama", return_value=bloques_mock),
+            patch.object(pvc, "_llamar_groq_chat", side_effect=fake_chat),
+        ):
+            clips = pvc.analizar_con_groq(
+                ruta_audio=str(self.fake_audio),
+                duracion_total=720.0,
+                job_dir=self.job_dir,
+                groq_api_key="gsk_test_cont",
+                pausa_entre_bloques=0.0,
+            )
+
+        # Solo 3 llamadas: B1 con modelo 1, B2 falla con modelo 1, B2 con modelo 2 (no reinicia B1)
+        self.assertEqual(len(llamadas), 3)
+        self.assertEqual(llamadas[0], pvc.GROQ_MODELOS_CANDIDATOS[0])
+        self.assertEqual(llamadas[1], pvc.GROQ_MODELOS_CANDIDATOS[0])
+        self.assertEqual(llamadas[2], pvc.GROQ_MODELOS_CANDIDATOS[1])
+        self.assertEqual(len(clips), 2)
+
+        ckpt_path = self.job_dir / "groq_checkpoint.json"
+        self.assertTrue(ckpt_path.exists())
+        ckpt = json.loads(ckpt_path.read_text(encoding="utf-8"))
+        self.assertIsInstance(ckpt, list)
+        self.assertEqual(len(ckpt), 2)
+
+    def test_groq_validacion_temporal_dual_y_bloque_vacio(self) -> None:
+        """Verifica aceptación de timestamps relativos/absolutos y manejo limpio de bloques vacíos ([])."""
+        transcripcion_mock = {
+            "duracion": 1000.0,
+            "segmentos": [{"start": 0.0, "end": 10.0, "text": "Intro"}],
+            "palabras": [],
+            "indices_picos": [],
+        }
+        bloques_mock = [
+            {"offset_seg": 0.0, "duracion_bloque": 360.0, "texto": "[00:00:00] Intro tranquila"},
+            {"offset_seg": 335.0, "duracion_bloque": 360.0, "texto": "[00:00:00] Climax"},
+        ]
+        resp_vacio = json.dumps({"clips": []})
+        resp_dual = json.dumps({
+            "clips": [
+                {"inicio": "00:00:10", "fin": "00:00:30", "titulo": "Relativo"},
+                {"inicio": "00:07:00", "fin": "00:07:20", "titulo": "Absoluto"},
+            ]
+        })
+        logs = []
+
+        with (
+            patch.object(pvc, "_transcribir_audio_groq", return_value=transcripcion_mock),
+            patch.object(pvc, "_segmentar_transcripcion_para_ollama", return_value=bloques_mock),
+            patch.object(pvc, "_llamar_groq_chat", side_effect=[resp_vacio, resp_dual]),
+        ):
+            clips = pvc.analizar_con_groq(
+                ruta_audio=str(self.fake_audio),
+                duracion_total=1000.0,
+                job_dir=self.job_dir,
+                groq_api_key="gsk_test_dual",
+                pausa_entre_bloques=0.0,
+                on_log=logs.append,
+            )
+
+        self.assertTrue(any("Bloque 1/2 sin momentos virales detectados" in m for m in logs))
+        self.assertEqual(len(clips), 2)
+        self.assertEqual(clips[0]["inicio"], "00:05:45")  # 335 + 10 = 345s
+        self.assertEqual(clips[1]["inicio"], "00:07:00")  # 420s absoluto
+
+    def test_groq_sin_response_format_y_salto_http_400(self) -> None:
+        """Verifica ausencia de response_format en payload Groq y salto limpio ante HTTP 400."""
+        fake_resp = _FakeHTTPResponse({"choices": [{"message": {"content": '{"clips": []}'}}]})
+        with patch("urllib.request.urlopen", return_value=fake_resp) as mock_urlopen:
+            pvc._llamar_groq_chat("gsk_key", "openai/gpt-oss-20b", "hola")
+            req = mock_urlopen.call_args[0][0]
+            payload = json.loads(req.data.decode("utf-8"))
+            self.assertNotIn("response_format", payload)
+            self.assertEqual(req.headers["User-agent"], "Mozilla/5.0 (X11; Linux x86_64) KicksazosStudio/5.0")
+
+        transcripcion_mock = {
+            "duracion": 120.0,
+            "segmentos": [{"start": 0.0, "end": 10.0, "text": "Clip"}],
+            "palabras": [],
+            "indices_picos": [],
+        }
+        bloques_mock = [{"offset_seg": 0.0, "duracion_bloque": 120.0, "texto": "[00:00:00] Clip"}]
+        err_400 = urllib.error.HTTPError(
+            url="https://api.groq.com/openai/v1/chat/completions",
+            code=400,
+            msg="Bad Request",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":{"code":"json_validate_failed"}}'),
+        )
+        resp_ok = json.dumps({"clips": [{"inicio": "00:00:05", "fin": "00:00:25", "titulo": "OK"}]})
+
+        with (
+            patch.object(pvc, "_transcribir_audio_groq", return_value=transcripcion_mock),
+            patch.object(pvc, "_segmentar_transcripcion_para_ollama", return_value=bloques_mock),
+            patch.object(pvc, "_llamar_groq_chat", side_effect=[err_400, resp_ok]),
+        ):
+            clips = pvc.analizar_con_groq(
+                ruta_audio=str(self.fake_audio),
+                duracion_total=120.0,
+                job_dir=self.job_dir,
+                groq_api_key="gsk_test_400",
+                pausa_entre_bloques=0.0,
+            )
+        self.assertEqual(len(clips), 1)
+
+    def test_ollama_respaldo_ligero_y_timeout_300s(self) -> None:
+        """Verifica modelo local ligero qwen3:8b por defecto y timeout de 300s en Ollama."""
+        self.assertEqual(pvc.MODELOS_LOCALES_OLLAMA[0], "gemma3:12b")
+        fake_resp = _FakeHTTPResponse(b'{"message":{"content":"{\\"clips\\":[]}"},"done":true}\n')
+        with patch("urllib.request.urlopen", return_value=fake_resp) as mock_urlopen:
+            pvc._llamar_ollama_chat("qwen3:8b", "hola")
+            self.assertEqual(mock_urlopen.call_args[1]["timeout"], 300.0)
 
 
 if __name__ == "__main__":
