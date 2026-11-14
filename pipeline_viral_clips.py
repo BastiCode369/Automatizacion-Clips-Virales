@@ -56,10 +56,18 @@ GEMINI_TIMEOUT_MS = 600_000  # google-genai HttpOptions.timeout usa milisegundos
 ZONA_HORARIA_LOCAL = timezone(timedelta(hours=-5))  # Hora local Colombia (-05:00)
 LIMITE_CUOTA_DIARIA_SHORTS = 6
 MODELOS_CANDIDATOS = [
+    "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
     "gemini-3.7-flash",
-    "gemini-3.5-flash-lite",
 ]
+MODELO_GEMINI_PREDETERMINADO = MODELOS_CANDIDATOS[0]
+MODELOS_GROQ = [
+    "llama-3.3-70b-versatile",
+    "qwen/qwen3-32b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+]
+GROQ_MODELO_WHISPER = "whisper-large-v3-turbo"
+GROQ_AUDIO_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 MODELOS_LOCALES_OLLAMA = ["qwen3:14b", "gemma3:12b", "qwen2.5:14b"]
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 WHISPER_MODEL_SIZE = "medium"
@@ -2049,10 +2057,18 @@ def _deduplicar_clips_solapados(clips: List[dict]) -> List[dict]:
     return resultado
 
 
+def _normalizar_modelo_gemini(modelo_preferido: Optional[str]) -> str:
+    """Normaliza el modelo Gemini preferido asegurando el predeterminado Gemini 3.5."""
+    txt = str(modelo_preferido or "").strip()
+    if not txt or txt.lower().startswith("auto"):
+        return MODELOS_CANDIDATOS[0]
+    return txt
+
+
 def analizar_con_gemini(
     ruta_audio: str | Path,
     duracion_total: Optional[float] = None,
-    modelo_preferido: Optional[str] = None,
+    modelo_preferido: Optional[str] = MODELOS_CANDIDATOS[0],
     job_dir: Optional[Path | str] = None,
     on_log: Optional[Callable[[str], None]] = None,
     on_telemetria: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -2083,7 +2099,8 @@ def analizar_con_gemini(
         else obtener_duracion_media(ruta_audio)
     )
 
-    modelo_label = (modelo_preferido or MODELOS_CANDIDATOS[0]).strip()
+    modelo_efectivo = _normalizar_modelo_gemini(modelo_preferido)
+    modelo_label = modelo_efectivo
     _emitir_telemetria(
         on_telemetria,
         [0.0],
@@ -2203,7 +2220,7 @@ def analizar_con_gemini(
                         client,
                         ruta_chunk,
                         dur_chunk,
-                        modelo_preferido,
+                        modelo_efectivo,
                         _log,
                         on_telemetria=_on_tele_worker,
                         bloque_actual=idx_chunk,
@@ -2214,7 +2231,7 @@ def analizar_con_gemini(
                         client,
                         ruta_chunk,
                         dur_chunk,
-                        modelo_preferido,
+                        modelo_efectivo,
                         _log,
                     )
             except Exception as e_chunk:
@@ -3230,6 +3247,558 @@ def analizar_con_ollama(
         },
         forzar=True,
     )
+    return clips_finales
+
+
+def _guardar_job_meta(
+    job_dir: Path,
+    job_id: str,
+    source_url: str,
+    motor_ia: str,
+    modelo: str,
+) -> None:
+    """Guarda metadatos no sensibles del job (URL fuente, motor, fecha) para reanudación 1-clic."""
+    ruta_meta = Path(job_dir) / "job_meta.json"
+    ahora_iso = datetime.now(ZONA_HORARIA_LOCAL).isoformat(timespec="seconds")
+    meta_actual: Dict[str, Any] = {}
+    if ruta_meta.is_file():
+        try:
+            cargado = json.loads(ruta_meta.read_text(encoding="utf-8"))
+            if isinstance(cargado, dict):
+                meta_actual = cargado
+        except (OSError, json.JSONDecodeError, ValueError):
+            meta_actual = {}
+
+    meta_actual["job_id"] = job_id
+    if source_url:
+        meta_actual["source_url"] = source_url
+    meta_actual["motor_ia"] = motor_ia
+    meta_actual["modelo"] = modelo
+    meta_actual.setdefault("created_at", ahora_iso)
+    meta_actual["updated_at"] = ahora_iso
+    try:
+        _escribir_json_atomico(ruta_meta, meta_actual)
+    except OSError:
+        pass
+
+
+def _llamar_groq_chat(
+    api_key: str,
+    modelo_groq: str,
+    prompt: str,
+) -> str:
+    """Ejecuta una llamada JSON al endpoint OpenAI-compatible de Groq Cloud."""
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    payload = {
+        "model": modelo_groq,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Responde exclusivamente con un objeto JSON válido con la clave raíz 'clips'.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.25,
+        "response_format": {"type": "json_object"},
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "KicksazosStudio/5.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=180.0) as resp:
+        cuerpo = json.loads(resp.read().decode("utf-8", errors="replace"))
+    choices = cuerpo.get("choices") or []
+    if not choices:
+        raise ValueError("Groq devolvió una respuesta sin choices.")
+    msg = choices[0].get("message") or {}
+    return str(msg.get("content") or "").strip()
+
+
+def _dividir_audio_por_tamano_groq(
+    ruta_audio: str | Path,
+    job_dir: Path,
+    max_bytes: int = 24 * 1024 * 1024,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[Path], List[float], bool]:
+    """
+    Comprueba el tamaño del audio. Si <= max_bytes devuelve [Path(ruta_audio)], [0.0], False.
+    Si supera max_bytes, divide sin recodificar en segmentos de 1 hora usando FFmpeg copy:
+    ffmpeg -hide_banner -loglevel error -y -i <ruta_audio> -c copy -f segment -segment_time 3600 <job_dir>/groq_audio_part_%02d.mp3
+    Calcula el offset temporal exacto de cada parte y devuelve (partes, offsets, es_temporal=True).
+    """
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+
+    p_audio = Path(ruta_audio).resolve()
+    tam = p_audio.stat().st_size
+    if tam <= max_bytes:
+        return [p_audio], [0.0], False
+
+    _log(
+        f"Audio ({tam / (1024 * 1024):.1f} MB) supera el límite de 24 MB para Groq; "
+        "segmentando sin re-codificar (-segment_time 3600)..."
+    )
+    job_dir = Path(job_dir).resolve()
+    job_dir.mkdir(parents=True, exist_ok=True)
+    patron_salida = job_dir / "groq_audio_part_%02d.mp3"
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(p_audio),
+        "-c",
+        "copy",
+        "-f",
+        "segment",
+        "-segment_time",
+        "3600",
+        str(patron_salida),
+    ]
+    subprocess.run(cmd, check=True)
+
+    partes = sorted(job_dir.glob("groq_audio_part_*.mp3"))
+    if not partes:
+        raise RuntimeError("No se generaron partes de audio para Groq.")
+
+    offsets: List[float] = []
+    dur_acumulada = 0.0
+    for p in partes:
+        offsets.append(dur_acumulada)
+        dur_parte = obtener_duracion_media(p) or 0.0
+        dur_acumulada += dur_parte
+
+    return partes, offsets, True
+
+
+def _peticion_multipart_groq_whisper(
+    url: str,
+    api_key: str,
+    ruta_archivo: Path,
+    modelo: str = GROQ_MODELO_WHISPER,
+    idioma: str = "es",
+    prompt: str = "Stream en vivo en Kick Colombia con jerga colombiana: parce, gonorrea, chimba, nea, sisas, marica, pirobo, WestCOL, Blessd, La Liendra, eldomi, Yhap.",
+    timeout: float = 300.0,
+) -> Dict[str, Any]:
+    """Ejecuta petición multipart/form-data a Groq audio transcriptions con timestamps verbose_json."""
+    boundary = f"----WebKitFormBoundaryGroqWhisper{int(time.time() * 1000)}"
+    crlf = b"\r\n"
+    body = bytearray()
+
+    def _agregar_campo(nombre: str, valor: str) -> None:
+        body.extend(f"--{boundary}".encode("utf-8") + crlf)
+        body.extend(f'Content-Disposition: form-data; name="{nombre}"'.encode("utf-8") + crlf + crlf)
+        body.extend(valor.encode("utf-8") + crlf)
+
+    _agregar_campo("model", modelo)
+    _agregar_campo("language", idioma)
+    _agregar_campo("response_format", "verbose_json")
+    _agregar_campo("timestamp_granularities[]", "word")
+    _agregar_campo("timestamp_granularities[]", "segment")
+    _agregar_campo("temperature", "0.0")
+    _agregar_campo("prompt", prompt)
+
+    nombre_archivo = ruta_archivo.name
+    tipo_mime = "audio/mpeg" if ruta_archivo.suffix.lower() == ".mp3" else "application/octet-stream"
+    body.extend(f"--{boundary}".encode("utf-8") + crlf)
+    body.extend(
+        f'Content-Disposition: form-data; name="file"; filename="{nombre_archivo}"'.encode("utf-8") + crlf
+    )
+    body.extend(f"Content-Type: {tipo_mime}".encode("utf-8") + crlf + crlf)
+    with open(ruta_archivo, "rb") as fa:
+        body.extend(fa.read())
+    body.extend(crlf)
+
+    body.extend(f"--{boundary}--".encode("utf-8") + crlf)
+
+    req = urllib.request.Request(
+        url,
+        data=bytes(body),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "KicksazosStudio/5.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def _transcribir_audio_groq(
+    ruta_audio: str | Path,
+    groq_api_key: Optional[str] = None,
+    job_dir: Optional[Path | str] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+    on_telemetria: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Transcribe audio en la nube con Groq Cloud (whisper-large-v3-turbo) con timestamps de palabra y segmento.
+    Maneja caché <job_dir>/whisper_transcript.json, fragmentación automática si > 24 MB y cálculo de picos RMS.
+    """
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+
+    api_key = groq_api_key or os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("Falta la variable de entorno GROQ_API_KEY para transcripción Groq.")
+
+    p_audio = Path(ruta_audio).resolve()
+    dir_job = Path(job_dir).resolve() if job_dir else BASE_DIR
+    cache_path = dir_job / "whisper_transcript.json"
+    ultimo_ts = [0.0]
+
+    # Reutilizar caché si ya existe y es válido
+    if cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(cached, dict)
+                and isinstance(cached.get("segmentos"), list)
+                and cached["segmentos"]
+                and isinstance(cached.get("palabras"), list)
+            ):
+                if "indices_picos" not in cached or cached["indices_picos"] is None:
+                    cached["indices_picos"] = sorted(
+                        _calcular_energia_segmentos_audio(str(p_audio), cached["segmentos"])
+                    )
+                _log(f"✓ Reutilizando transcripción en caché: {cache_path.name}")
+                _emitir_telemetria(
+                    on_telemetria,
+                    ultimo_ts,
+                    {
+                        "etapa": "groq_whisper",
+                        "titulo_etapa": "Transcripción Nube (Groq Whisper)",
+                        "porcentaje": 100.0,
+                        "velocidad_red": "Cache Disco",
+                        "tamano_total": f"{len(cached['segmentos'])} segs",
+                        "eta": "00:00",
+                        "modelo_ia": GROQ_MODELO_WHISPER,
+                        "detalle": "Transcripción Groq cargada desde disco",
+                    },
+                    forzar=True,
+                )
+                return cached
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+
+    _log(f"Iniciando transcripción en nube con Groq ({GROQ_MODELO_WHISPER})...")
+    _emitir_telemetria(
+        on_telemetria,
+        ultimo_ts,
+        {
+            "etapa": "groq_whisper",
+            "titulo_etapa": "Transcripción Nube (Groq Whisper)",
+            "porcentaje": 5.0,
+            "velocidad_red": "API Groq",
+            "tamano_total": "--",
+            "eta": "--:--",
+            "modelo_ia": GROQ_MODELO_WHISPER,
+            "detalle": f"Conectando a {GROQ_AUDIO_URL}...",
+        },
+        forzar=True,
+    )
+
+    partes, offsets, es_temporal = _dividir_audio_por_tamano_groq(
+        p_audio,
+        job_dir=dir_job,
+        max_bytes=24 * 1024 * 1024,
+        on_log=_log,
+    )
+
+    segmentos_finales: List[Dict[str, Any]] = []
+    palabras_finales: List[Dict[str, Any]] = []
+    idioma = "es"
+    total_partes = len(partes)
+
+    try:
+        for idx_p, (parte_p, offset_s) in enumerate(zip(partes, offsets), start=1):
+            _emitir_telemetria(
+                on_telemetria,
+                ultimo_ts,
+                {
+                    "etapa": "groq_whisper",
+                    "titulo_etapa": "Transcripción Nube (Groq Whisper)",
+                    "porcentaje": round(5.0 + (idx_p - 1) / total_partes * 85.0, 1),
+                    "velocidad_red": "API Groq",
+                    "tamano_total": f"Parte {idx_p}/{total_partes}",
+                    "eta": "--:--",
+                    "modelo_ia": GROQ_MODELO_WHISPER,
+                    "detalle": f"Transcribiendo parte {idx_p}/{total_partes} ({parte_p.name})...",
+                },
+                forzar=True,
+            )
+
+            resp_json = _peticion_multipart_groq_whisper(
+                url=GROQ_AUDIO_URL,
+                api_key=api_key,
+                ruta_archivo=parte_p,
+                modelo=GROQ_MODELO_WHISPER,
+            )
+
+            idioma = str(resp_json.get("language") or idioma)
+
+            for seg in resp_json.get("segments") or []:
+                txt_seg = str(seg.get("text") or "").strip()
+                if not txt_seg:
+                    continue
+                ini_s = float(seg.get("start", 0.0) or 0.0) + offset_s
+                fin_s = float(seg.get("end", ini_s) or ini_s) + offset_s
+                seg_dict = {"start": round(ini_s, 3), "end": round(fin_s, 3), "text": txt_seg}
+                if "pico_vocal" in seg:
+                    seg_dict["pico_vocal"] = bool(seg["pico_vocal"])
+                segmentos_finales.append(seg_dict)
+
+            for w in resp_json.get("words") or []:
+                w_txt = str(w.get("word") or "").strip()
+                if w_txt:
+                    w_ini = float(w.get("start", 0.0) or 0.0) + offset_s
+                    w_fin = float(w.get("end", w_ini) or w_ini) + offset_s
+                    palabras_finales.append(
+                        {
+                            "start": round(w_ini, 3),
+                            "end": round(w_fin, 3),
+                            "word": w_txt,
+                        }
+                    )
+    finally:
+        if es_temporal:
+            for p in partes:
+                try:
+                    if p.is_file():
+                        p.unlink()
+                except OSError:
+                    pass
+
+    if not segmentos_finales:
+        raise RuntimeError("Groq Whisper no devolvió segmentos de habla válidos.")
+
+    duracion_total = float(obtener_duracion_media(p_audio) or 0.0)
+    if duracion_total <= 0.0:
+        duracion_total = max(float(s["end"]) for s in segmentos_finales)
+
+    indices_picos = sorted(_calcular_energia_segmentos_audio(str(p_audio), segmentos_finales))
+    picos_set = set(indices_picos)
+    for idx_s, seg in enumerate(segmentos_finales):
+        seg["pico_vocal"] = idx_s in picos_set
+
+    _log(
+        f"✓ Groq Whisper completado: {len(segmentos_finales)} segmentos, "
+        f"{len(palabras_finales)} palabras, {len(indices_picos)} picos vocales detectados."
+    )
+
+    resultado = {
+        "duracion": round(duracion_total, 3),
+        "duracion_total": round(duracion_total, 3),
+        "idioma": idioma,
+        "segmentos": segmentos_finales,
+        "palabras": palabras_finales,
+        "indices_picos": indices_picos,
+    }
+
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(resultado, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+    _emitir_telemetria(
+        on_telemetria,
+        ultimo_ts,
+        {
+            "etapa": "groq_whisper",
+            "titulo_etapa": "Transcripción Nube (Groq Whisper)",
+            "porcentaje": 100.0,
+            "velocidad_red": "API Groq",
+            "tamano_total": f"{len(segmentos_finales)} segs",
+            "eta": "00:00",
+            "modelo_ia": GROQ_MODELO_WHISPER,
+            "detalle": f"Listo ({len(palabras_finales)} palabras, {len(indices_picos)} picos vocales)",
+        },
+        forzar=True,
+    )
+    return resultado
+
+
+def analizar_con_groq(
+    ruta_audio: str,
+    modelo_preferido: Optional[str] = None,
+    duracion_total: Optional[float] = None,
+    job_dir: Optional[Path | str] = None,
+    groq_api_key: Optional[str] = None,
+    respaldo_local_auto: bool = True,
+    on_log: Optional[Callable[[str], None]] = None,
+    on_telemetria: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> List[dict]:
+    """Transcribe con Groq Cloud (whisper-large-v3-turbo) o fallback local y realiza curaduría viral en Groq."""
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+        else:
+            print(msg)
+
+    api_key = (groq_api_key or os.environ.get("GROQ_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("Falta la variable de entorno GROQ_API_KEY.")
+
+    modelo_elegido = str(modelo_preferido or "").strip() or MODELOS_GROQ[0]
+    if modelo_elegido in MODELOS_CANDIDATOS:
+        modelo_elegido = MODELOS_GROQ[0]
+
+    dir_job = Path(job_dir).resolve() if job_dir else BASE_DIR
+
+    transcripcion: Optional[Dict[str, Any]] = None
+    try:
+        transcripcion = _transcribir_audio_groq(
+            ruta_audio,
+            groq_api_key=api_key,
+            job_dir=dir_job,
+            on_log=_log,
+            on_telemetria=on_telemetria,
+        )
+    except Exception as err_groq_audio:
+        es_cuota_429 = isinstance(err_groq_audio, GeminiQuotaExhaustedError) or (
+            "429" in str(err_groq_audio) or "RATE_LIMIT" in str(err_groq_audio).upper()
+        )
+        if respaldo_local_auto:
+            _log(
+                f"[AVISO] Falló transcripción en Groq Whisper ({err_groq_audio}); "
+                "recurriendo automáticamente a transcripción local Whisper..."
+            )
+            transcripcion = _transcribir_audio_whisper_local(
+                ruta_audio,
+                job_dir=dir_job,
+                on_log=_log,
+                on_telemetria=on_telemetria,
+            )
+        else:
+            if es_cuota_429:
+                raise GeminiQuotaExhaustedError(
+                    f"Groq Whisper cuota 429 agotada: {err_groq_audio}"
+                ) from err_groq_audio
+            raise
+
+    duracion_efectiva = float(
+        duracion_total
+        or transcripcion.get("duracion")
+        or transcripcion.get("duracion_total")
+        or obtener_duracion_media(ruta_audio)
+        or 0.0
+    )
+    segmentos = transcripcion.get("segmentos") or []
+    palabras = transcripcion.get("palabras") or []
+    indices_picos = set(int(i) for i in (transcripcion.get("indices_picos") or []))
+
+    bloques = _segmentar_transcripcion_para_ollama(
+        segmentos=segmentos,
+        indices_picos=indices_picos,
+        duracion_total=duracion_efectiva,
+    )
+    if not bloques:
+        raise RuntimeError("No hay contenido transcrito suficiente para analizar con Groq.")
+
+    _log(f"\n[2/4] Curaduría viral en Groq Nube ({modelo_elegido}) en {len(bloques)} bloque(s)...")
+    ultimo_ts = [0.0]
+    clips_acumulados: List[dict] = []
+    total_b = len(bloques)
+
+    for idx_b, bloque in enumerate(bloques, start=1):
+        offset_seg = float(bloque["offset_seg"])
+        dur_bloque = float(bloque["duracion_bloque"])
+        prompt = _construir_prompt_ollama(bloque["texto"], dur_bloque)
+
+        _emitir_telemetria(
+            on_telemetria,
+            ultimo_ts,
+            {
+                "etapa": "gemini",
+                "titulo_etapa": f"Curaduría Viral Groq ({modelo_elegido})",
+                "porcentaje": round(((idx_b - 1) / total_b) * 100.0, 1),
+                "bloque_actual": idx_b,
+                "bloques_completados": idx_b - 1,
+                "total_bloques": total_b,
+                "bloques_activos": [f"Bloque {idx_b}/{total_b}"],
+                "modelo_ia": modelo_elegido,
+                "eta": "--:--",
+                "detalle": f"Enviando transcripción bloque {idx_b}/{total_b} a Groq Cloud...",
+            },
+            forzar=True,
+        )
+
+        try:
+            texto_resp = _llamar_groq_chat(api_key, modelo_elegido, prompt)
+        except urllib.error.HTTPError as err_http:
+            detalle = ""
+            try:
+                detalle = err_http.read().decode("utf-8", errors="replace")
+            except Exception:
+                detalle = str(err_http)
+            if err_http.code == 429:
+                raise GeminiQuotaExhaustedError(f"Groq cuota 429 agotada ({modelo_elegido}): {detalle}") from err_http
+            raise RuntimeError(f"Groq HTTP {err_http.code} ({modelo_elegido}): {detalle}") from err_http
+
+        clips_bloque = _limpiar_y_parsear_json(
+            texto_resp,
+            duracion_total=dur_bloque,
+            permitir_vacio=(total_b > 1),
+        )
+        for clip in clips_bloque:
+            try:
+                ini_abs = max(0.0, hhmmss_a_segundos(clip["inicio"]) + offset_seg)
+                fin_abs = max(0.0, hhmmss_a_segundos(clip["fin"]) + offset_seg)
+            except (KeyError, ValueError, TypeError):
+                continue
+            if duracion_efectiva > 0.0:
+                if ini_abs >= duracion_efectiva - 2.0:
+                    continue
+                fin_abs = min(fin_abs, duracion_efectiva)
+            dur_clip_abs = fin_abs - ini_abs
+            if dur_clip_abs < 5.0:
+                continue
+
+            subs_whisper = _construir_subtitulos_desde_whisper(
+                palabras,
+                ini_abs,
+                fin_abs,
+                segmentos=segmentos,
+            )
+            clip_enriquecido = dict(clip)
+            clip_enriquecido["inicio"] = segundos_a_hhmmss(ini_abs)
+            clip_enriquecido["fin"] = segundos_a_hhmmss(fin_abs)
+            clip_enriquecido["duracion_segundos"] = int(round(dur_clip_abs))
+            clip_enriquecido["subtitulos"] = subs_whisper
+            clip_enriquecido["subtitulos_origen"] = "whisper_word_timestamps"
+            clip_enriquecido["motor_ia"] = "groq"
+            clip_enriquecido["modelo_ia"] = modelo_elegido
+            clips_acumulados.append(clip_enriquecido)
+
+    clips_finales = _deduplicar_clips_solapados(clips_acumulados)
+    if not clips_finales:
+        raise RuntimeError(f"Groq ({modelo_elegido}) no detectó momentos virales válidos.")
+
+    for idx_f, clip_f in enumerate(clips_finales, start=1):
+        clip_f["id"] = idx_f
+
+    _guardar_y_sincronizar_clips(clips_finales, job_dir=job_dir)
+    _log(f"✓ Análisis Groq completado ({modelo_elegido}): {len(clips_finales)} clips guardados en clips.json")
     return clips_finales
 
 
@@ -4860,7 +5429,7 @@ def _limpiar_jobs_antiguos(
 
 def ejecutar_pipeline_completo(
     url: str,
-    modelo_preferido: Optional[str] = None,
+    modelo_preferido: Optional[str] = MODELOS_CANDIDATOS[0],
     solo_analisis: bool = False,
     subir_youtube: bool = True,
     publish_at_inicio: Optional[str] = None,
@@ -4872,7 +5441,7 @@ def ejecutar_pipeline_completo(
     respaldo_local_auto: bool = True,
     job_dir: Optional[Path | str] = None,
 ) -> Generator[Dict[str, Any], None, None]:
-    """Orquestador único (CLI y GUI) que ejecuta el pipeline híbrido (Gemini/Local) con telemetría y reanudación."""
+    """Orquestador único (CLI y GUI) que ejecuta el pipeline híbrido (Gemini/Groq/Local) con telemetría y reanudación."""
     def _log(msg: str) -> None:
         if on_log is not None:
             on_log(msg)
@@ -4887,11 +5456,17 @@ def ejecutar_pipeline_completo(
         return
 
     motor_normalizado = str(motor_ia or "gemini").strip().lower()
-    if motor_normalizado not in ("gemini", "local"):
+    if motor_normalizado not in ("gemini", "groq", "local"):
         motor_normalizado = "gemini"
 
-    if motor_normalizado != "local" and not os.environ.get("GEMINI_API_KEY"):
+    if motor_normalizado == "gemini" and not os.environ.get("GEMINI_API_KEY"):
         msg = "Falta GEMINI_API_KEY en el archivo .env o en las variables de entorno."
+        _log(f"[ERROR] {msg}")
+        yield _emitir_estado("error", 0.0, msg, error=msg)
+        return
+
+    if motor_normalizado == "groq" and not os.environ.get("GROQ_API_KEY"):
+        msg = "Falta GROQ_API_KEY en el archivo .env o en las variables de entorno."
         _log(f"[ERROR] {msg}")
         yield _emitir_estado("error", 0.0, msg, error=msg)
         return
@@ -4917,6 +5492,26 @@ def ejecutar_pipeline_completo(
         ctx = JobContext(job_id=ruta_jdir.name, job_dir=ruta_jdir)
     else:
         ctx = crear_contexto_job(url_limpia)
+
+    modelo_gemini_efectivo = _normalizar_modelo_gemini(modelo_preferido)
+    modelo_local_efectivo = _normalizar_modelo_ollama(modelo_local)
+    modelo_groq_efectivo = (
+        str(modelo_preferido or "").strip()
+        if str(modelo_preferido or "").strip() and str(modelo_preferido or "").strip() not in MODELOS_CANDIDATOS
+        else MODELOS_GROQ[0]
+    )
+    modelo_meta = (
+        modelo_local_efectivo
+        if motor_normalizado == "local"
+        else (modelo_groq_efectivo if motor_normalizado == "groq" else modelo_gemini_efectivo)
+    )
+    _guardar_job_meta(
+        ctx.job_dir,
+        ctx.job_id,
+        url_limpia,
+        motor_normalizado,
+        modelo_meta,
+    )
 
     try:
         eliminados = _limpiar_jobs_antiguos(dias_retencion=7, job_dir_actual=ctx.job_dir)
@@ -4998,7 +5593,6 @@ def ejecutar_pipeline_completo(
             dur_str = segundos_a_hhmmss(duracion) if duracion else "Desconocida"
             _log(f"✓ Audio extraído correctamente ({audio_temp}) | Duración: {dur_str}")
 
-        modelo_local_efectivo = _normalizar_modelo_ollama(modelo_local)
         motor_efectivo = motor_normalizado
 
         def _correr_analisis_local(modelo_loc: str) -> Generator[Dict[str, Any], None, List[dict]]:
@@ -5054,12 +5648,76 @@ def ejecutar_pipeline_completo(
 
         if clips:
             _log(f"✓ Reutilizando {len(clips)} clip(s) desde caché de reanudación ({ctx.job_dir / 'clips.json'})")
-            if any(c.get("motor_ia") == "local" or c.get("subtitulos_origen") == "whisper_word_timestamps" for c in clips):
+            if any(
+                c.get("motor_ia") in ("local", "groq")
+                or c.get("subtitulos_origen") == "whisper_word_timestamps"
+                for c in clips
+            ):
                 motor_efectivo = "local"
         elif motor_normalizado == "local":
             clips = yield from _correr_analisis_local(modelo_local_efectivo)
+        elif motor_normalizado == "groq":
+            tele_groq_init = {
+                "etapa": "gemini",
+                "titulo_etapa": f"Curaduría Viral Groq ({modelo_groq_efectivo})",
+                "porcentaje": 0.0,
+                "bloque_actual": 1,
+                "bloques_completados": 0,
+                "total_bloques": 1,
+                "bloques_activos": [],
+                "modelo_ia": modelo_groq_efectivo,
+                "eta": "--:--",
+                "detalle": f"Iniciando transcripción Whisper + Groq ({modelo_groq_efectivo})...",
+            }
+            if on_telemetria is not None:
+                on_telemetria(dict(tele_groq_init))
+            yield _emitir_estado(
+                fase="gemini",
+                progreso=0.30,
+                mensaje=f"Fase 2/4: Analizando narrativa viral con Groq ({modelo_groq_efectivo})...",
+                clips=clips,
+                ultimo_video=ultimo_video,
+                job_dir=job_dir_str,
+                telemetria=tele_groq_init,
+            )
+            try:
+                clips = yield from _ejecutar_paso_con_telemetria(
+                    analizar_con_groq,
+                    audio_temp,
+                    construir_estado=lambda tele: _emitir_estado(
+                        fase=str(tele.get("etapa") or "gemini"),
+                        progreso=0.30 + 0.24 * (float(tele.get("porcentaje", 0.0)) / 100.0),
+                        mensaje=(
+                            f"Fase 2/4: {tele.get('titulo_etapa', 'Análisis Groq')} "
+                            f"[{tele.get('detalle', '')}]"
+                        ),
+                        clips=clips,
+                        ultimo_video=ultimo_video,
+                        job_dir=job_dir_str,
+                        telemetria=tele,
+                    ),
+                    on_telemetria_externa=on_telemetria,
+                    modelo_preferido=modelo_groq_efectivo,
+                    duracion_total=duracion,
+                    job_dir=ctx.job_dir,
+                    respaldo_local_auto=respaldo_local_auto,
+                    on_log=_log,
+                )
+            except Exception as err_groq:
+                es_cuota_429 = isinstance(err_groq, GeminiQuotaExhaustedError) or (
+                    "429" in str(err_groq) or "RATE_LIMIT" in str(err_groq).upper()
+                )
+                if respaldo_local_auto and es_cuota_429:
+                    _log(
+                        f"[RESPALDO LOCAL] Cuota Groq 429 agotada ({err_groq}); "
+                        f"conmutando automáticamente a motor local (Whisper + {modelo_local_efectivo})..."
+                    )
+                    motor_efectivo = "local"
+                    clips = yield from _correr_analisis_local(modelo_local_efectivo)
+                else:
+                    raise
         else:
-            modelo_label = (modelo_preferido or MODELOS_CANDIDATOS[0]).strip()
+            modelo_label = modelo_gemini_efectivo
             tele_gemini_init = {
                 "etapa": "gemini",
                 "titulo_etapa": f"Analizando Narrativa Viral ({modelo_label})",
@@ -5101,7 +5759,7 @@ def ejecutar_pipeline_completo(
                     ),
                     on_telemetria_externa=on_telemetria,
                     duracion_total=duracion,
-                    modelo_preferido=modelo_preferido,
+                    modelo_preferido=modelo_gemini_efectivo,
                     job_dir=ctx.job_dir,
                     on_log=_log,
                 )
@@ -5165,7 +5823,7 @@ def ejecutar_pipeline_completo(
             "on_telemetria": on_telemetria,
         }
         if _acepta_kwarg(_orquestar_render_y_subida, "alinear_subtitulos"):
-            kwargs_orq["alinear_subtitulos"] = motor_efectivo != "local"
+            kwargs_orq["alinear_subtitulos"] = motor_efectivo == "gemini"
 
         for estado_lote in _orquestar_render_y_subida(**kwargs_orq):
             if estado_lote.get("ultimo_video"):
@@ -5297,6 +5955,10 @@ def _formatear_barra_cli(estado: Dict[str, Any], ancho_barra: int = 24) -> str:
         vel = tele.get("velocidad_red") or "CPU int8"
         tam = tele.get("tamano_total") or "--"
         partes.extend([f"Whisper ({vel})", str(tam)])
+    elif etapa == "groq_whisper":
+        mod = tele.get("modelo_ia") or GROQ_MODELO_WHISPER
+        tam = tele.get("tamano_total") or "--"
+        partes.extend([f"Groq Whisper ({mod})", str(tam)])
     elif etapa == "local_ollama":
         modelo = tele.get("modelo_ia") or tele.get("velocidad_red") or MODELOS_LOCALES_OLLAMA[0]
         tam = tele.get("tamano_total") or "--"
@@ -5376,7 +6038,10 @@ class RenderizadorProgresoCLI:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Pipeline híbrido v4.1 de clips virales Kicksazos (Gemini Cloud o 100% Local)"
+        description=(
+            "Pipeline híbrido v5.0 de clips virales Kicksazos "
+            "(Gemini 3.5 Cloud / Groq Cloud / 100% Local)"
+        )
     )
     parser.add_argument("url", help="URL del stream/VOD o ruta a un archivo de video local")
     parser.add_argument(
@@ -5391,14 +6056,20 @@ def main():
     )
     parser.add_argument(
         "--motor",
-        choices=["gemini", "local"],
+        choices=["gemini", "groq", "local"],
         default="gemini",
-        help="Motor de análisis viral: 'gemini' (nube) o 'local' (Whisper + Ollama 100%% offline)",
+        help=(
+            "Motor de análisis viral: 'gemini' (nube, Gemini 3.5 por defecto), "
+            "'groq' (Groq nube) o 'local' (Whisper + Ollama 100%% offline)"
+        ),
     )
     parser.add_argument(
         "--modelo",
-        default=None,
-        help="Modelo Gemini preferido para iniciar la cascada de inferencia en modo nube",
+        default=MODELOS_CANDIDATOS[0],
+        help=(
+            f"Modelo nube preferido (predeterminado Gemini 3.5: {MODELOS_CANDIDATOS[0]}; "
+            f"o modelo Groq en modo 'groq')"
+        ),
     )
     parser.add_argument(
         "--modelo-local",

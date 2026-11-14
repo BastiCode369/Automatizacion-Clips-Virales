@@ -1,35 +1,36 @@
 # DOSSIER TÉCNICO MAESTRO: PIPELINE AUTÓNOMO KICKSAZOS
-**Versión de Arquitectura:** v4.1 (Híbrido Nube Gemini + 100% Local Offline Whisper/Ollama + Command Center)
-**Destino:** Fuente de Conocimiento Experto para NotebookLM / Auditoría Técnica de Alto Nivel
+**Versión de Arquitectura:** v5.0 (Aplicación de Escritorio Nativa PySide6/Qt6, Gemini 3.5 Predeterminado, Groq Nube, Estudio 9:16 y Gestor de Jobs)
+**Destino:** Fuente de Conocimiento Experto para Auditoría Técnica
 **Repositorio Base:** `/home/bastiboy/clips_automation`
-**Entorno Operativo:** Kubuntu Linux 64-bit | Kernel Linux 6.11 / 7.0 | Aceleración por Hardware VAAPI (`/dev/dri/renderD128`)
+**Entorno Operativo:** Kubuntu Linux 64-bit | KDE Plasma / Wayland | Aceleración por Hardware VAAPI (`/dev/dri/renderD128`)
 
 ---
 
 ## 1. Resumen Ejecutivo, Hardware, Entorno y Árbol de Directorios
 
 ### 1.1 Resumen Ejecutivo
-El **Pipeline Autónomo Kicksazos (v4.1)** es un sistema integral de ingeniería de software audiovisual e inteligencia artificial diseñado para la extracción, curaduría, renderizado vertical 9:16 y publicación automatizada de clips virales procedentes de streams y VODs de **Kick**, YouTube o Twitch, así como de archivos multimedia locales (`.mp4`, `.mkv`).
+**Kicksazos Studio (v5.0)** es una aplicación de escritorio nativa (PySide6 / Qt6) y pipeline audiovisual de ingeniería para extracción, curaduría viral, renderizado vertical 9:16 y publicación en YouTube Shorts / TikTok desde streams/VODs de **Kick**, YouTube, Twitch o videos locales.
 
-El pipeline opera bajo una arquitectura híbrida dual seleccionable:
-- **Modo Nube (`gemini`):** Análisis multimodal directo con Google Gemini 3 Flash / Flash-Lite (`temperature=0.20`), segmentación paralela con `ThreadPoolExecutor(max_workers=3)` para audios largos (`> 1800 s`), reintentos con jitter y backoff, y renderizado en **2 pasadas con micro-alineación fonética** por clip (`_alinear_subtitulos_con_clip_renderizado`). Ante agotamiento total de cuotas Free Tier (`429`), conmuta automáticamente a motor local si `respaldo_local_auto=True`.
-- **Modo Local 100% Offline (`local`):** Transcripción fonética local mediante `faster-whisper` (`medium`, `int8`, CPU) alimentada por buffer PCM float32 16 kHz directo, detección de picos vocales por energía acústica RMS (`>= 1.65x` mediana global), liberación inmediata de memoria RAM (`del model; gc.collect()`), curaduría viral mediante LLMs locales en **Ollama** (`qwen3:14b` por defecto, o `gemma3:12b` en `127.0.0.1:11434`), construcción de subtítulos dinámicos de 2–4 palabras desde los `word_timestamps` de Whisper, descarga de Ollama de RAM (`keep_alive=0`), y renderizado en **1 sola pasada directa** de FFmpeg sin requerir API externa ni archivos `raw_clip` intermedios.
+Opera mediante tres motores seleccionables de curaduría viral:
+- **Modo Nube Gemini (`gemini`, predeterminado):** Análisis multimodal directo tomando **Gemini 3.5 (`gemini-3.5-flash-lite`) como modelo predeterminado oficial** (`MODELOS_CANDIDATOS[0]`), con cascada automática ante errores 429 hacia `gemini-3.8-flash` y `gemini-3.7-flash`, segmentación paralela (`ThreadPoolExecutor(max_workers=3)`) y renderizado en **2 pasadas con micro-alineación fonética**.
+- **Modo Groq Nube (`groq`):** Transcripción delegada a la nube vía Groq Audio API (`whisper-large-v3-turbo`) con timestamps por palabra y segmento, división automática sin recodificar si supera 24 MB, picos vocales RMS y curaduría viral en Groq Cloud API (`llama-3.3-70b-versatile` / modelos Groq) con renderizado en **1 sola pasada directa** y respaldo automático a Whisper local ante fallo de red o cuota `429`.
+- **Modo Local 100% Offline (`local`):** Transcripción local `faster-whisper` (`medium`, `int8`, CPU) + detección RMS de picos + **Ollama** (`127.0.0.1:11434`) + subtítulos `word_timestamps` y renderizado FFmpeg en **1 sola pasada directa**.
 
 ### 1.2 Hardware del Host y Entorno Operativo
-- **Sistema Operativo:** Kubuntu Linux 64-bit (base Ubuntu con entorno KDE Plasma / Wayland).
-- **Procesador (CPU):** AMD Ryzen 5 7520U with Radeon Graphics (4 núcleos físicos, 8 subprocesos lógicos, frecuencia base 2.8 GHz / turbo 4.3 GHz).
-- **Memoria RAM:** 16 GB LPDDR5-5500 MHz (14 GiB reconocidos por kernel, 8.0 GiB swap activa en SSD NVMe).
-- **Aceleración por Hardware:** GPU integrada AMD Radeon 610M (`radeonsi`, driver Mesa Gallium 26.0.8, DRM 3.64). Dispositivo VAAPI en `/dev/dri/renderD128` verificado con `detectar_encoder_hardware()` mediante codificación nula de 1 frame.
-- **Intérprete de Python:** `Python 3.14.4` en entorno virtual activo `/home/bastiboy/clips_automation/venv`.
-- **Motor Multimedia FFmpeg:** `ffmpeg version 8.0.1-3ubuntu2` (GCC 15 Ubuntu) con filtros `libass` (`fontsdir=`), `subtitles`, `boxblur`, `scale`, `overlay`, `setsar` y telemetría de socket en `-progress pipe:1`.
-- **Descargador yt-dlp:** `yt-dlp 2026.08.19` en sistema y `2026.10.26` en venv con soporte JavaScript vía Node.js y componentes remotos EJS.
-- **Servidor Ollama:** Ollama v0.5+ activo en `127.0.0.1:11434`. Modelos verificados en disco: `qwen3:14b` (9.3 GB, 8k contexto) y `gemma3:12b` (8.2 GB).
+- **Sistema Operativo:** Kubuntu Linux 64-bit (KDE Plasma / Wayland).
+- **Procesador (CPU):** AMD Ryzen 5 7520U with Radeon Graphics (4 núcleos, 8 hilos).
+- **Memoria RAM:** 16 GB LPDDR5-5500 MHz (14 GiB utilizables + 8 GiB swap NVMe).
+- **Aceleración por Hardware:** AMD Radeon 610M VAAPI (`/dev/dri/renderD128`) con fallback automático a `libx264`.
+- **Intérprete de Python:** `Python 3.14.4` en `/home/bastiboy/clips_automation/venv`.
+- **Motor Multimedia FFmpeg:** `ffmpeg 8.0.1` (`libass` con `fontsdir=`, `h264_vaapi`, `-progress pipe:1`).
+- **Descargador yt-dlp:** `yt-dlp 2026.10.26` con runtime JS vía Node.js.
+- **Servidor Ollama:** `127.0.0.1:11434` con detección dinámica de modelos instalados (`qwen3:14b`, `gemma3:12b`).
 
 ### 1.3 Contenido Literal de `requirements.txt`
 ```text
 google-genai>=3.0.0
 pydantic>=2.14
-gradio>=6.31
+PySide6>=6.8.0
 google-api-python-client>=2.201
 google-auth>=2.62
 google-auth-oauthlib>=1.5
@@ -38,50 +39,39 @@ yt-dlp>=2026.10.26
 faster-whisper>=1.1.0
 ```
 
-### 1.4 Árbol de Directorios del Repositorio
+### 1.4 Árbol de Directorios del Repositorio (v5.0 Desktop)
 ```text
 /home/bastiboy/clips_automation/
-├── .env                              # [PROTEGIDO - ZERO-SECRETS] Variables de entorno (GEMINI_API_KEY, etc.)
-├── .gitignore                         # Exclusiones de control de versiones Git
-├── CEREBRO_COMPLETO_KICKSAZOS.md      # Dossier técnico maestro consolidado v4.1
-├── CONTEXTO_PROYECTO_KICKSAZOS.md     # Base de conocimiento y contexto operativo unificado v4.1
-├── Contexto y Objetivos del Proyecto Kicksazos.md # Documento histórico original
-├── app_interfaz.py                    # Command Center web Gradio 6.31 (4 pestañas)
-├── client_secret.json                 # [PROTEGIDO - ZERO-SECRETS] Credenciales cliente OAuth 2.0 YouTube
-├── clips.json                         # Registro canónico del último lote de clips procesado
-├── gradio.log                         # Bitácora de ejecución de la interfaz web
-├── pipeline_viral_clips.py            # Motor principal de orquestación, curaduría híbrida y render
-├── procesar_video_universal.py        # CLI de conveniencia para re-render de un único segmento
-├── requirements.txt                   # Especificación de dependencias del entorno virtual
-├── subidas_shorts.json                # Historial acumulativo de clips subidos a YouTube
-├── subir_shorts.py                    # Módulo de autenticación OAuth 2.0 y subida a YouTube Shorts
+├── .env                              # [PROTEGIDO - ZERO-SECRETS] Variables de entorno
+├── CEREBRO_COMPLETO_KICKSAZOS.md      # Dossier técnico maestro consolidado v5.0
+├── CONTEXTO_PROYECTO_KICKSAZOS.md     # Base de conocimiento y contexto operativo v5.0
+├── app_interfaz.py                    # Entrada principal Desktop PySide6 (KicksazosMainWindow, 5 vistas)
+├── ui_desktop/                        # Arquitectura modular de escritorio Qt6
+│   ├── __init__.py
+│   ├── theme.py                       # Hoja QSS Dark Studio (#0b0e14, #131822, #53fc18, #8b5cf6, #ff2a2a)
+│   ├── services.py                    # Servicios puros, validación de rutas, escaneo jobs/, packs y stats
+│   ├── workers.py                     # PipelineWorker, SingleClipWorker, SystemProbeWorker (QThread)
+│   └── widgets/
+│       ├── __init__.py
+│       ├── command_center.py          # Vista 1: Centro de Mando y Monitor Broadcast Multi-Hilo
+│       ├── clips_studio.py            # Vista 2: Estudio de Clips 3 columnas + Editor Rápido & Re-render
+│       ├── video_player.py            # Reproductor nativo 9:16 QtMultimedia + fallback xdg-open
+│       ├── jobs_manager.py            # Vista 3: Gestor de Jobs & Reanudación desde checkpoints
+│       ├── history_quota.py           # Vista 4: Historial & Cuota YouTube Shorts 24h
+│       └── stats_dashboard.py         # Vista 5: Estadísticas & Rendimiento 100% offline
+├── client_secret.json                 # [PROTEGIDO - ZERO-SECRETS] OAuth 2.0 YouTube
+├── clips.json                         # Registro canónico del último lote procesado
+├── pipeline_viral_clips.py            # Backend orquestador, curaduría Gemini 3.5 / Groq / Ollama y render
+├── procesar_video_universal.py        # CLI auxiliar de re-render
+├── requirements.txt                   # Dependencias (con PySide6>=6.8.0, sin Gradio)
+├── subidas_shorts.json                # Historial acumulativo de YouTube Shorts
+├── subir_shorts.py                    # Autenticación OAuth 2.0 y subida YouTube Shorts
 ├── token.json                         # [PROTEGIDO - ZERO-SECRETS] Token OAuth activo
 ├── token_cuenta_anterior.json         # [PROTEGIDO - ZERO-SECRETS] Token histórico
-├── assets/
-│   ├── fonts/
-│   │   └── Montserrat-ExtraBold.ttf   # Tipografía oficial para subtítulos .ass
-│   ├── watermark.png                  # Marca de agua oficial @Kicksazos (420px ancho)
-│   └── Gemini_Generated_Image_...jpeg # Imagen de marca
-├── clips_finales/                     # Directorio de salida con clips verticales 9:16 generados (.mp4)
-├── jobs/                              # Directorios de trabajo temporales aislados por job (<job_id>/)
-│   └── <job_id>/                      # Contexto de ejecución aislado
-│       ├── temp_audio.mp3             # Pista de audio extraída (12 kHz mono 24 kbps)
-│       ├── whisper_transcript.json    # Transcripción local Whisper en caché con timestamps y picos
-│       ├── clips.json                 # Metadatos de clips seleccionados para el job
-│       ├── subs_<id>.ass              # Subtítulos .ass generados por cada clip
-│       └── raw_clip_<id>.mp4          # Corte preliminar sin subtítulos (sólo en modo nube 2 pasadas)
-├── legacy/                            # Scripts históricos archivados
-│   ├── analizar_stream.py
-│   ├── recortar_clips.py
-│   ├── subir_lote.py
-│   └── clips_virales/
-│       └── reporte_clips.json
-├── tests/                             # Suite de pruebas automatizadas (64 tests / 100% OK)
-│   ├── test_pipeline_v31.py           # 16 tests: Extracción audio, resiliencia, chunking y estilos ASS
-│   ├── test_pipeline_v32.py           # 14 tests: Tipografía Montserrat, libass fontsdir y telemetría yt-dlp/ffmpeg
-│   ├── test_pipeline_v40.py           # 19 tests: Audio ultraligero, Gemini paralelo, 2 pasadas, locks, limpieza y UI
-│   └── test_pipeline_v41.py           # 15 tests: Safe zone v4.1, Whisper, Ollama, 1 pasada y fallback 429
-└── venv/                              # Entorno virtual aislado Python 3.14.4
+├── assets/                            # Montserrat-ExtraBold.ttf y watermark.png
+├── clips_finales/                     # Clips verticales 9:16 renderizados (.mp4)
+├── jobs/                              # Directorios de checkpoint (<job_id>/job_meta.json, audio, whisper, clips.json)
+└── tests/                             # 7 suites automatizadas (v31, v32, v40, v41, v43, test_desktop_v50.py y test_groq_whisper.py)
 ```
 
 ---
@@ -360,8 +350,9 @@ def _construir_prompt_ollama(transcripcion_bloque: str, duracion_bloque: float) 
     )
 ```
 
-### 3.2 Configuración del Modo Nube (`gemini`)
-- **Cascada de Modelos:** `MODELOS_CANDIDATOS = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash-lite']`.
+### 3.2 Configuración del Modo Nube (`gemini` y `groq`)
+- **Cascada de Modelos Gemini (Gemini 3.5 predeterminado):** `MODELOS_CANDIDATOS = ['gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.7-flash']` (`MODELO_GEMINI_PREDETERMINADO = 'gemini-3.5-flash-lite'`).
+- **Groq Nube (`groq`):** Transcripción local Whisper + API Groq OpenAI-compatible (`llama-3.3-70b-versatile`) con fallback automático a Ollama ante 429.
 - **Parámetros de Inferencia:** `temperature=0.20`, `HttpOptions.timeout = 600_000` ms (10 minutos).
 - **Chunking Paralelo:** Si el audio supera los 30 minutos (`> 1800 s`), `_segmentar_audio_en_chunks()` divide el archivo con `ffmpeg -c copy` en bloques de 25 minutos (`1500 s`) con `60 s` de solapamiento. Los bloques se procesan concurrentemente en un `ThreadPoolExecutor(max_workers=3)`.
 - **Deduplicación de Solapamientos:** `_deduplicar_clips_solapados()` detecta solapamientos `> 50%` entre clips de bloques adyacentes y resuelve la colisión mediante `_puntaje_calidad_clip()`, preservando el segmento con mayor duración, conteo de subtítulos y riqueza semántica.
@@ -522,7 +513,7 @@ def _construir_comando_render(
 
 ---
 
-## 5. Orquestación Concurrente, Command Center Gradio y Publicación en YouTube Shorts
+## 5. Orquestación Concurrente, Aplicación Desktop PySide6 (v5.0) y YouTube Shorts
 
 ### 5.1 Orquestación Paralela y Seguridad Concurrente (`_orquestar_render_y_subida`)
 La orquestación coordina la preparación de la fuente de video, el renderizado concurrente y la subida controlada mediante las siguientes garantías:
@@ -532,25 +523,13 @@ La orquestación coordina la preparación de la fuente de video, el renderizado 
 - **Descarga Única de Video Fuente:** Para streams remotos de duración menor o igual a 1 hora, descarga la fuente completa en 1080p una sola vez (`descargar_video_fuente()`), permitiendo que los workers recorten localmente a máxima velocidad sin descargas fragmentadas redundantes.
 - **Limpieza Automática de Jobs Antiguos (`_limpiar_jobs_antiguos`):** Al inicio de cada ejecución, escanea `CARPETA_JOBS` y elimina directorios temporales cuya fecha de modificación supere los 7 días (`dias_retencion=7`), preservando el job en curso.
 
-### 5.2 Command Center Gradio v4.1 (`app_interfaz.py`)
-La interfaz web opera en el puerto `7860` con un diseño broadcast oscuro (`#0b0e14`, `#121824`, verde neón Kick `#53fc18` y rojo YouTube `#ff0000`), estructurada en 4 pestañas operativas:
-1. **⚡ 1. Centro de Mando:**
-   - Selector de motor IA: Radio button interactivo `☁️ Gemini (Nube)` vs `💻 Local Offline (Whisper + Ollama)` que conmuta dinámicamente la visibilidad de los dropdowns de modelos sin recargar la página (`_alternar_motor_ui`).
-   - Dropdown dinámico de modelos locales poblado en tiempo real desde `listar_modelos_ollama_disponibles()` (`127.0.0.1:11434`).
-   - Checkbox de respaldo automático `respaldo_local_auto`.
-   - Parámetros de publicación programada (`publishAt` en hora local Colombia `-05:00` con intervalo en horas).
-   - **Panel Broadcast de Telemetría Multi-Hilo:** Renderizado en HTML/CSS con stepper iluminado de 4 fases (`1. Red & Audio`, `2. IA Paralela`, `3. Render VAAPI`, `4. YouTube Shorts`), pills de workers activos concurrentes con FPS y porcentaje, barra de etapa y barra global del job.
-2. **🎬 2. Galería & Metadatos Duales:**
-   - Tarjetas responsivas con reproductor de video de los clips generados.
-   - Bloque **🔴 YouTube Shorts:** Título (máx 60 chars), Descripción con CTA y Etiquetas SEO en píldoras copiables con un solo clic.
-   - Bloque **🎵 TikTok:** Gancho Visual de Portada (4–6 palabras), Caption optimizado para comentarios (máx 150 chars) y Hashtags de nicho.
-   - Botones interactivos con JavaScript nativo (`navigator.clipboard`) que cambian visualmente a `✓ Copiado` durante 1.4 segundos.
-3. **📜 3. Historial & Cuota YouTube:**
-   - Medidor de cuota diaria en vivo con barra de progreso (límite 6 subidas en 24 horas móviles).
-   - Tabla de auditoría con enlaces directos a YouTube Shorts (`https://youtube.com/shorts/<id>`), estado de privacidad y fecha de subida.
-4. **📊 4. Estadísticas & Rendimiento (`calcular_estadisticas_sistema()`):**
-   - Cálculo 100% offline a partir de `subidas_shorts.json` y los `clips.json` de todos los jobs históricos.
-   - Métricas clave: Total de jobs procesados, clips virales curados, clips renderizados en 9:16, total subidos a YouTube, minutos totales de contenido analizado, modelo IA más utilizado y tasa de éxito global.
+### 5.2 Aplicación de Escritorio Nativa PySide6 / Qt6 (`app_interfaz.py` + `ui_desktop/`)
+Sustituye por completo a Gradio por una interfaz nativa **Dark Studio** (`KicksazosMainWindow(QMainWindow)`) con barra lateral de navegación, barra superior de estado en vivo (Cuota YouTube `X/6`, Ollama `127.0.0.1:11434`, Encoder `AMD VAAPI` / `CPU`) y `QStackedWidget` con **5 vistas**:
+1. **⚡ Centro de Mando (`command_center.py`):** Configuración de URL/video local, selector de motor (`☁️ Gemini Nube` con **Gemini 3.5** predeterminado, `⚡ Groq Nube`, `💻 Local Offline Whisper+Ollama`), checkboxes, programación `publishAt (-05:00)` y monitor broadcast multi-hilo (`PipelineWorker` con cancelación instantánea vía `terminar_procesos_activos()`).
+2. **🎬 Estudio de Clips (`clips_studio.py` + `video_player.py`):** Reproductor vertical 9:16 nativo (`QMediaPlayer` + `QVideoWidget` + `QAudioOutput` + `xdg-open`), exportación segura (`Exportar / Guardar copia`), editor rápido de metadatos/timestamps, **Re-renderizar este Clip** y **Subir solo este Clip a YouTube** (`SingleClipWorker`), y copia de Packs YouTube/TikTok.
+3. **🔄 Gestor de Jobs (`jobs_manager.py`):** Listado de `jobs/` con fuente registrada en `job_meta.json` (o inferida), badges de checkpoints (`Audio`, `Whisper`, `Clips JSON`, `Renders X/Y`), tamaño en disco, reanudación en 1 clic (`--job-dir`) y eliminación segura confirmada.
+4. **📜 Historial & Cuota YouTube (`history_quota.py`):** Medidor de cuota 24h (`X/6`) y tabla filtrable sobre `subidas_shorts.json` con copia/apertura de enlace.
+5. **📊 Estadísticas & Rendimiento (`stats_dashboard.py`):** Cálculos 100% offline, 6 KPIs, distribución visual por duración y últimos jobs procesados.
 
 ### 5.3 Publicación Automatizada en YouTube Shorts (`subir_shorts.py`)
 - **Flujo OAuth 2.0 Headless:** Genera credenciales locales en `token.json` utilizando `InstalledAppFlow` con el scope estricto `https://www.googleapis.com/auth/youtube.upload`.
@@ -1067,27 +1046,33 @@ Resultado: **Ran 64 tests in 10.865s — OK (0 fallos, 0 errores)**.
 - `TestFase4OrquestadorCLIGradioV41`:
   - `test_ejecutar_pipeline_completo_local_sin_gemini_api_key`: Ejecución completa offline sin variable `GEMINI_API_KEY`.
   - `test_ejecutar_pipeline_completo_respaldo_auto_429`: Conmutación automática a motor local ante error 429 de Gemini.
-  - `test_gradio_ui_v41_selector_hibrido_y_telemetria`: Verificación de componentes interactivos de la interfaz Gradio v4.1.
+  - `test_desktop_ui_v50_selector_hibrido_y_telemetria`: Verificación de selector Gemini 3.5 / Groq / Local y telemetría Qt6.
   - `test_cli_main_flags_local_y_formateo_barra`: Compatibilidad de argumentos CLI (`--motor`, `--modelo-local`).
+
+#### 5. `tests/test_pipeline_v43.py` & `tests/test_desktop_v50.py`
+- Resiliencia v4.3 (escritura atómica, circuit-breaker Ollama, `terminar_procesos_activos`, reanudación `--job-dir`) y cobertura v5.0 Desktop (Gemini 3.5 default en backend/CLI/UI, Groq 429, anti-path-traversal + Zero-Secrets, `SingleClipWorker` re-render/subida individual y navegación 5 vistas).
 
 ---
 
 ## 8. Deuda Técnica Resuelta, Limitaciones Conocidas y Roadmap
 
 ### 8.1 Deuda Técnica Resuelta al 100%
-1. **Desacoplamiento Total de APIs Propietarias:** Soporte 100% offline mediante Whisper medium int8 y Ollama, eliminando bloqueos por cuota 429 en Gemini Free Tier.
-2. **Eliminación del Bug de PyAV >= 19:** Decodificación FFmpeg float32 directa que erradica cuelgues de audio en faster-whisper.
-3. **Aceleración de Renderizado Local:** Reducción del tiempo de renderizado a la mitad en modo local mediante pasada única directa (sin `raw_clip` intermedio).
-4. **Optimización de Memoria RAM (16 GB):** Secuenciamiento estricto con descarga de Whisper (`del model; gc.collect()`) y descarga de Ollama (`keep_alive=0`) antes de invocar los encoders FFmpeg.
-5. **Centrado Óptico y Safe Zone de Subtítulos (v4.1):** `WrapStyle: 0`, `MarginL=80`, `MarginR=170` y `MarginV=550`, garantizando legibilidad total sin solapamiento con botones de YouTube Shorts ni TikTok.
-6. **Aislamiento Multi-Job y Cero Residuos:** Contextos independientes en `jobs/<job_id>/` y poda automática de jobs con antigüedad superior a 7 días.
-7. **Seguridad Absoluta contra XSS:** Sanitización exhaustiva con `html.escape()` en todos los componentes dinámicos de Gradio.
-8. **Tolerancia a Fallos de Red en VODs:** Re-intento automático con invalidación de caché ante errores HTTP 403/410 de URLs firmadas.
+1. **Desacoplamiento Total de APIs Propietarias:** Soporte multimodal Gemini 3.5 predeterminado, Groq Cloud y 100% offline mediante Whisper medium int8 y Ollama.
+2. **Eliminación del Bug de PyAV >= 19:** Decodificación FFmpeg float32 directa que erradica cuelgues de audio en `faster-whisper`.
+3. **Aceleración de Renderizado Local:** Reducción del tiempo de renderizado a la mitad en modo local mediante pasada única directa.
+4. **Optimización de Memoria RAM (16 GB):** Secuenciamiento estricto con descarga de Whisper (`del model; gc.collect()`) y descarga de Ollama (`keep_alive=0`) antes de FFmpeg.
+5. **Centrado Óptico y Safe Zone de Subtítulos (v4.1):** `WrapStyle: 0`, `MarginL=80`, `MarginR=170` y `MarginV=550`.
+6. **Aislamiento Multi-Job y `job_meta.json`:** Contextos independientes en `jobs/<job_id>/` con fuente original guardada, poda automática de jobs >7 días y reanudación en 1 clic desde UI.
+7. **Seguridad de Rutas y Zero-Secrets (`ui_desktop/services.py`):** Validación anti-path-traversal (`validar_ruta_dentro_proyecto`) y bloqueo explícito contra lectura o exposición de `.env`, `client_secret.json`, `token.json` y `token_cuenta_anterior.json`.
+8. **Blindaje de Producción v4.3 + Migración Nativa PySide6 (v5.0):**
+   - Serialización con `threading.RLock()` (`_CLIPS_JSON_LOCK`, `_HISTORIAL_LOCK`) y escritura atómica (`os.replace`) vía `_escribir_json_atomico`.
+   - Higiene de subprocesos (`_PROCESOS_ACTIVOS`, `terminar_procesos_activos()`) y cierre limpio de `QThread` + `QMediaPlayer` en `KicksazosMainWindow.closeEvent()`.
+   - Reemplazo integral de Gradio por `app_interfaz.py` + paquete `ui_desktop/` en estilo **Dark Studio**.
 
 ### 8.2 Limitaciones Conocidas
-- **Cuota de YouTube Data API v3:** La cuota por defecto del proyecto en Google Cloud (~10.000 unidades diarias) restringe las subidas a ~6 videos cada 24 horas móviles.
-- **Tiempo de Inferencia CPU en Whisper Medium:** En procesadores de 4 núcleos (como el Ryzen 5 7520U), transcribir un stream de 2 horas en CPU toma aproximadamente 8 a 12 minutos (alrededor de 10x-15x tiempo real).
-- **VODs de Kick con Segmentos Privados:** Si el streamer silencia o elimina fragmentos por copyright, `yt-dlp` puede reportar advertencias en fragmentos específicos que FFmpeg descarta automáticamente.
+- **Cuota de YouTube Data API v3:** Límite por defecto de ~6 subidas en 24 horas móviles.
+- **Tiempo de Inferencia CPU en Whisper Medium:** Transcripción en CPU ~10x-15x tiempo real.
+- **VODs de Kick con Segmentos Privados:** Advertencias en fragmentos censurados que FFmpeg descarta automáticamente.
 
 ### 8.3 Guía de Comandos Rápidos para Operadores y Agentes
 ```bash
@@ -1095,22 +1080,23 @@ Resultado: **Ran 64 tests in 10.865s — OK (0 fallos, 0 errores)**.
 cd /home/bastiboy/clips_automation
 source venv/bin/activate
 
-# Ejecución de suite de pruebas unitarias completa (64 tests)
-venv/bin/python -m unittest discover -s tests -v
+# Verificación de sintaxis y suite completa de pruebas en modo Qt offscreen (77 tests)
+venv/bin/python -m py_compile pipeline_viral_clips.py app_interfaz.py ui_desktop/*.py ui_desktop/widgets/*.py
+QT_QPA_PLATFORM=offscreen venv/bin/python -m unittest discover -s tests -v
 
-# Pipeline en Modo Nube Gemini (Análisis + Render + Subida Privada a YouTube)
+# Pipeline en Modo Nube Gemini (Gemini 3.5 gemini-3.5-flash-lite predeterminado)
 venv/bin/python pipeline_viral_clips.py "https://kick.com/eldomi/videos/<uuid>"
 
-# Pipeline en Modo 100% Local Offline (Whisper + Ollama qwen3:14b, sin GEMINI_API_KEY)
+# Pipeline en Modo Groq Nube o 100% Local Offline
+venv/bin/python pipeline_viral_clips.py "https://kick.com/eldomi/videos/<uuid>" --motor groq
 venv/bin/python pipeline_viral_clips.py "https://kick.com/eldomi/videos/<uuid>" --motor local --modelo-local qwen3:14b
 
-# Procesamiento de archivo de video local sin subida (sólo clips locales 9:16)
+# Reanudar un job previo conservando checkpointing incremental
+venv/bin/python pipeline_viral_clips.py "https://kick.com/eldomi/videos/<uuid>" --job-dir jobs/<job_id>
+
+# Procesamiento de archivo local sin subida a YouTube
 venv/bin/python pipeline_viral_clips.py "/ruta/a/mi_video.mp4" --motor local --sin-subida
 
-# Iniciar Command Center Web (Gradio Studio v4.1)
+# Iniciar Aplicación de Escritorio Nativa (Kicksazos Studio v5.0 PySide6)
 venv/bin/python app_interfaz.py
-# Acceder vía navegador local en http://127.0.0.1:7860
-
-# Re-renderizar un clip específico manualmente
-venv/bin/python procesar_video_universal.py "<URL|archivo.mp4>" 00:15:20 00:15:55 1
 ```
