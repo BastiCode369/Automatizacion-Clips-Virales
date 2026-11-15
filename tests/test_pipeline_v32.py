@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import gradio as gr
+from PySide6.QtWidgets import QApplication
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -20,6 +20,7 @@ if str(ROOT_DIR) not in sys.path:
 
 import app_interfaz  # noqa: E402
 import pipeline_viral_clips as pvc  # noqa: E402
+from ui_desktop import services as ui_services  # noqa: E402
 
 
 def _fake_popen(stdout_text: str = "", stderr_text: str = "", returncode: int = 0):
@@ -464,54 +465,63 @@ class TestFase2Y3OrquestadorCLIYGradio(unittest.TestCase):
         lineas_plain = [ln for ln in buf_plain.getvalue().splitlines() if ln.strip()]
         self.assertEqual(len(lineas_plain), 2)
 
-    def test_panel_telemetria_gradio_estados_y_escape_xss(self):
-        idle_html = app_interfaz.construir_panel_telemetria_html(None)
-        self.assertIn("En espera", idle_html)
+    def test_telemetria_desktop_normalizacion_y_render_en_ventana(self):
+        idle = ui_services.normalizar_estado_telemetria(None)
+        self.assertEqual(idle["etapa_nombre"], "En espera")
+        self.assertEqual(idle["progreso"], 0.0)
 
-        xss_html = app_interfaz.construir_panel_telemetria_html(
+        audio_norm = ui_services.normalizar_estado_telemetria(
             {
                 "fase": "audio",
                 "progreso": 0.15,
-                "mensaje": "<script>alert(1)</script>",
+                "mensaje": "Descargando <script>alert(1)</script>",
                 "telemetria": {
                     "etapa": "descarga",
-                    "titulo_etapa": "<img src=x onerror=alert(1)>",
+                    "titulo_etapa": "Red & Audio",
                     "porcentaje": 42.5,
-                    "velocidad_red": "<script>99MiB/s</script>",
-                    "tamano_total": "50MiB",
+                    "velocidad_red": "12MiB/s",
                     "eta": "00:04",
-                    "detalle": "<b>det</b>",
+                    "detalle": "Extrayendo audio",
                 },
             }
         )
-        self.assertNotIn("<script>", xss_html)
-        self.assertIn("&lt;script&gt;", xss_html)
-        self.assertIn("42.5%", xss_html)
-        self.assertIn("50MiB", xss_html)
+        self.assertEqual(audio_norm["etapa_num"], 1)
+        self.assertEqual(audio_norm["progreso"], 42.5)
+        self.assertEqual(audio_norm["velocidad"], "12MiB/s")
 
-        render_html = app_interfaz.construir_panel_telemetria_html(
-            {
-                "fase": "render",
-                "progreso": 0.72,
-                "telemetria": {
-                    "etapa": "render",
-                    "titulo_etapa": "Renderizado 9:16",
-                    "porcentaje": 80.0,
-                    "fps": "95.2",
-                    "velocidad_x": "3.17x",
-                    "eta": "00:02",
-                    "encoder": "h264_vaapi",
-                    "clip_id": 3,
-                    "clip_indice": 1,
-                    "total_clips": 2,
-                },
-            }
-        )
-        self.assertIn("h264_vaapi", render_html)
-        self.assertIn("3.17x • 95.2 FPS", render_html)
-        self.assertIn("Clip #3 (1/2)", render_html)
+        app = app_interfaz.crear_aplicacion([])
+        ventana = app_interfaz.KicksazosMainWindow(auto_probe=False)
+        try:
+            ventana.vista_command_center.actualizar_telemetria(
+                {
+                    "fase": "render",
+                    "progreso": 0.72,
+                    "mensaje": "Render 9:16 activo",
+                    "telemetria": {
+                        "etapa": "render",
+                        "titulo_etapa": "Renderizado 9:16",
+                        "porcentaje": 80.0,
+                        "fps": "95.2",
+                        "velocidad_x": "3.17x",
+                        "eta": "00:02",
+                        "encoder": "h264_vaapi",
+                        "clips_activos": [
+                            {"clip_id": 3, "porcentaje": 80.0, "fps": "95.2", "velocidad_render": "3.17x"}
+                        ],
+                    },
+                }
+            )
+            self.assertEqual(ventana.vista_command_center.kpi_encoder.lbl_valor.text(), "h264_vaapi")
+            self.assertEqual(ventana.vista_command_center.kpi_velocidad.lbl_valor.text(), "3.17x")
+            self.assertEqual(ventana.vista_command_center.kpi_fps.lbl_valor.text(), "95.2")
+            self.assertEqual(ventana.vista_command_center.bar_etapa.value(), 80)
+        finally:
+            ventana.close()
+            app.processEvents()
 
-    def test_ejecutar_pipeline_gradio_9_tuplas_y_skip_y_construccion_ui(self):
+    def test_kicksazos_main_window_5_vistas_y_pipeline_worker(self):
+        from ui_desktop.workers import PipelineWorker
+
         estados_mock = [
             {
                 "fase": "audio",
@@ -535,56 +545,34 @@ class TestFase2Y3OrquestadorCLIYGradio(unittest.TestCase):
             },
         ]
 
-        with patch.object(app_interfaz, "ejecutar_pipeline_completo", return_value=iter(estados_mock)), patch.object(
-            app_interfaz, "obtener_datos_galeria", return_value=([], None, "<div></div>", [])
-        ), patch.object(app_interfaz, "obtener_tabla_historial", return_value=([], "<div></div>")):
-            salidas = list(
-                app_interfaz.ejecutar_pipeline_gradio(
-                    url="https://www.youtube.com/watch?v=test",
-                    modelo_preferido="Auto (Recomendado)",
-                    subir_auto_yt=False,
-                    solo_analisis=False,
-                    gemini_key="",
-                    progress=None,
-                )
-            )
-
-        self.assertEqual(len(salidas), 3)
-        for fila in salidas:
-            self.assertEqual(len(fila), 9)
-        self.assertIn("5MiB/s", salidas[0][1])
-        self.assertIn("h264_vaapi", salidas[1][1])
-        # Tick intermedio usa gr.skip() en galería, player e historial para evitar re-escaneo 3x/s
-        skip_marker = gr.skip()
-        self.assertEqual(salidas[1][3], skip_marker)
-        self.assertEqual(salidas[1][4], skip_marker)
-        self.assertEqual(salidas[1][6], skip_marker)
-        self.assertIn("100.0%", salidas[2][1])
-
-        demo = app_interfaz.construir_interfaz()
+        app = app_interfaz.crear_aplicacion([])
+        ventana = app_interfaz.KicksazosMainWindow(auto_probe=False)
         try:
-            self.assertIsInstance(demo, gr.Blocks)
+            self.assertEqual(ventana.stack_vistas.count(), 5)
+            self.assertEqual(
+                ventana.vista_command_center.combo_modelo.currentData(),
+                pvc.MODELOS_CANDIDATOS[0],
+            )
+            recibidos = []
+            terminados = []
+            with patch.object(pvc, "ejecutar_pipeline_completo", return_value=iter(estados_mock)):
+                worker = PipelineWorker(
+                    url="https://www.youtube.com/watch?v=test",
+                    modelo_preferido=pvc.MODELOS_CANDIDATOS[0],
+                    subir_youtube=False,
+                    solo_analisis=False,
+                )
+                worker.telemetria_actualizada.connect(recibidos.append)
+                worker.pipeline_finalizado.connect(lambda ok, msg: terminados.append((ok, msg)))
+                worker.run()
+            self.assertEqual(len(recibidos), 3)
+            self.assertEqual(recibidos[0]["velocidad"], "5MiB/s")
+            self.assertEqual(recibidos[1]["encoder"], "h264_vaapi")
+            self.assertEqual(recibidos[2]["progreso_global"], 100.0)
+            self.assertEqual(terminados, [(True, "Todo listo")])
         finally:
-            demo.close()
-            for obj_demo in (demo, getattr(app_interfaz, "demo", None)):
-                if obj_demo is not None:
-                    try:
-                        obj_demo.close()
-                    except Exception:
-                        pass
-            import asyncio
-            import gc
-
-            try:
-                asyncio.set_event_loop(None)
-            except Exception:
-                pass
-            for obj in list(gc.get_objects()):
-                try:
-                    if isinstance(obj, asyncio.AbstractEventLoop) and not obj.is_closed() and not obj.is_running():
-                        obj.close()
-                except Exception:
-                    pass
+            ventana.close()
+            app.processEvents()
 
 
 if __name__ == "__main__":

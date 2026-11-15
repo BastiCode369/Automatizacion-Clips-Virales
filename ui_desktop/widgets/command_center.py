@@ -455,7 +455,7 @@ class CommandCenterWidget(QWidget):
                 self.combo_modelo.addItem(mod, mod)
             self.combo_modelo.setCurrentIndex(0)
             self.btn_refrescar_ollama.show()
-            self.kpi_modelo.set_value(modelos[0] if modelos else "qwen3:14b")
+            self.kpi_modelo.set_value(modelos[0] if modelos else "qwen3:8b")
 
     def cargar_job_para_reanudar(self, job_info: Dict[str, Any]) -> None:
         """Carga automáticamente URL/fuente y carpeta jobs/<id> desde el Gestor de Jobs."""

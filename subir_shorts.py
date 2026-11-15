@@ -9,6 +9,8 @@ import random
 import socket
 import ssl
 import sys
+import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,6 +31,7 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 CLIENT_SECRETS_FILE = BASE_DIR / "client_secret.json"
 TOKEN_FILE = BASE_DIR / "token.json"
 HISTORIAL_SUBIDAS_FILE = BASE_DIR / "subidas_shorts.json"
+_HISTORIAL_LOCK = threading.RLock()
 
 CODIGOS_HTTP_REINTENTABLES = {500, 502, 503, 504}
 ERRORES_RED_TRANSITORIOS = (
@@ -167,16 +170,17 @@ def autenticar_youtube(interactivo: bool = False):
 def cargar_historial_subidas(
     ruta_json: str | Path = HISTORIAL_SUBIDAS_FILE,
 ) -> List[Dict[str, Any]]:
-    """Carga el historial de subidas desde subidas_shorts.json."""
+    """Carga el historial de subidas desde subidas_shorts.json de forma thread-safe."""
     ruta = Path(ruta_json)
-    if not ruta.exists():
-        return []
-    try:
-        with open(ruta, "r", encoding="utf-8") as f:
-            datos = json.load(f)
-            return datos if isinstance(datos, list) else []
-    except Exception:
-        return []
+    with _HISTORIAL_LOCK:
+        if not ruta.exists():
+            return []
+        try:
+            with open(ruta, "r", encoding="utf-8") as f:
+                datos = json.load(f)
+                return datos if isinstance(datos, list) else []
+        except (OSError, json.JSONDecodeError, ValueError):
+            return []
 
 
 def verificar_cuota_diaria(
@@ -222,16 +226,30 @@ def registrar_subida(
     registro: Dict[str, Any],
     ruta_json: str | Path = HISTORIAL_SUBIDAS_FILE,
 ) -> List[Dict[str, Any]]:
-    """Agrega o actualiza un registro de subida en subidas_shorts.json."""
+    """Agrega o actualiza un registro de subida en subidas_shorts.json de forma atómica y thread-safe."""
     ruta = Path(ruta_json)
-    historial = cargar_historial_subidas(ruta)
-    video_id = registro.get("youtube_id")
-    if video_id:
-        historial = [item for item in historial if item.get("youtube_id") != video_id]
-    historial.append(registro)
-    with open(ruta, "w", encoding="utf-8") as f:
-        json.dump(historial, f, indent=2, ensure_ascii=False)
-    return historial
+    with _HISTORIAL_LOCK:
+        historial = cargar_historial_subidas(ruta)
+        video_id = registro.get("youtube_id")
+        if video_id:
+            historial = [item for item in historial if item.get("youtube_id") != video_id]
+        historial.append(registro)
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".tmp_subidas_", suffix=".json", dir=str(ruta.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(historial, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, ruta)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+        return historial
 
 
 def subir_short(
@@ -330,7 +348,7 @@ def subir_short(
             status, response = request.next_chunk()
             reintentos_consecutivos = 0
             if status:
-                print(f"  Progreso de subida: {int(status.progress() * 100)}%")
+                _log(f"  Progreso de subida: {int(status.progress() * 100)}%")
         except HttpError as err:
             codigo = getattr(err, "status_code", None) or getattr(
                 getattr(err, "resp", None), "status", None

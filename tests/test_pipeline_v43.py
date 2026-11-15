@@ -247,10 +247,16 @@ class TestEstabilidadYConcurrenciaV43(unittest.TestCase):
             mock_yt.assert_not_called()
             self.assertEqual(estados[-1]["fase"], "completado")
 
-    def test_cerrar_interfaz_seguro_gradio_sin_error(self):
-        fake_demo = mock.MagicMock()
-        app_interfaz.cerrar_interfaz_seguro(fake_demo)
-        fake_demo.close.assert_called_once()
+    def test_cerrar_interfaz_desktop_pyside6_sin_error(self):
+        app = app_interfaz.crear_aplicacion([])
+        ventana = app_interfaz.KicksazosMainWindow(auto_probe=False)
+        try:
+            self.assertEqual(ventana.stack_vistas.count(), 5)
+            ventana.show()
+            app.processEvents()
+        finally:
+            ventana.close()
+            app.processEvents()
 
 
 if __name__ == "__main__":

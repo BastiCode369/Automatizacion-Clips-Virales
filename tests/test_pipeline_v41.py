@@ -12,14 +12,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import gradio as gr
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 import app_interfaz  # noqa: E402
 import pipeline_viral_clips as pvc  # noqa: E402
+from ui_desktop import services as ui_services  # noqa: E402
 
 
 class _FakeHTTPResponse:
@@ -126,7 +125,7 @@ class TestFase2MotorLocalWhisperYOllama(unittest.TestCase):
 
         with patch.object(pvc.urllib.request, "urlopen", return_value=_FakeHTTPResponse(tags_json)):
             modelos = pvc.listar_modelos_ollama_disponibles()
-        self.assertEqual(modelos[:3], ["qwen3:14b", "gemma3:12b", "llama3.1:8b"])
+        self.assertEqual(modelos[:3], ["gemma3:12b", "qwen3:14b", "llama3.1:8b"])
         self.assertNotIn("nomic-embed-text:latest", modelos)
 
         with patch.object(
@@ -640,49 +639,48 @@ class TestFase4OrquestadorCLIGradioV41(unittest.TestCase):
         self.assertFalse(capturado["respaldo_local_auto"])
         self.assertFalse(capturado["subir_youtube"])
 
-    def test_gradio_ui_v41_selector_hibrido_y_telemetria(self):
-        html_w = app_interfaz.construir_panel_telemetria_html(
+    def test_desktop_ui_v50_selector_hibrido_y_telemetria(self):
+        norm = ui_services.normalizar_estado_telemetria(
             {
                 "fase": "local_whisper",
                 "progreso": 0.4,
-                "mensaje": "Transcribiendo <script>alert(1)</script>",
+                "mensaje": "Transcribiendo localmente",
                 "telemetria": {
                     "etapa": "local_whisper",
                     "titulo_etapa": "Transcripción Local (Whisper Medium)",
                     "porcentaje": 60.0,
                     "velocidad_red": "CPU int8",
-                    "tamano_total": "18 segs",
+                    "eta": "00:18",
                     "detalle": "Procesando",
                 },
             }
         )
-        self.assertIn("Whisper Medium int8", html_w)
-        self.assertIn("Motor 100% Local (Secuencial)", html_w)
-        self.assertNotIn("<script>alert(1)</script>", html_w)
+        self.assertEqual(norm["etapa_num"], 2)
+        self.assertEqual(norm["progreso"], 60.0)
+        self.assertEqual(norm["velocidad"], "CPU int8")
 
-        with patch.object(app_interfaz, "listar_modelos_ollama_disponibles", return_value=["qwen3:14b", "gemma3:12b"]):
-            demo = app_interfaz.construir_interfaz()
+        app = app_interfaz.crear_aplicacion([])
+        ventana = app_interfaz.KicksazosMainWindow(auto_probe=False)
         try:
-            self.assertIsInstance(demo, gr.Blocks)
-            radios = [c for c in demo.blocks.values() if isinstance(c, gr.Radio)]
-            dropdowns = [c for c in demo.blocks.values() if isinstance(c, gr.Dropdown)]
-            self.assertEqual(len(radios), 1)
-            self.assertGreaterEqual(len(dropdowns), 2)
+            cc = ventana.vista_command_center
+            self.assertEqual(cc.combo_motor.count(), 3)
+            self.assertEqual(cc.combo_motor.currentData(), "gemini")
+            self.assertEqual(cc.combo_modelo.currentData(), pvc.MODELOS_CANDIDATOS[0])
+
+            cc.actualizar_modelos_ollama(["qwen3:14b", "gemma3:12b"])
+            idx_local = cc.combo_motor.findData("local")
+            cc.combo_motor.setCurrentIndex(idx_local)
+            modelos_ui = [
+                cc.combo_modelo.itemData(i) for i in range(cc.combo_modelo.count())
+            ]
+            self.assertEqual(modelos_ui, ["qwen3:14b", "gemma3:12b"])
+
+            cc.actualizar_telemetria(norm)
+            self.assertEqual(cc.bar_etapa.value(), 60)
+            self.assertEqual(cc.kpi_velocidad.lbl_valor.text(), "CPU int8")
         finally:
-            try:
-                demo.close()
-            except Exception:
-                pass
-            try:
-                asyncio.set_event_loop(None)
-            except Exception:
-                pass
-            for obj in list(gc.get_objects()):
-                try:
-                    if isinstance(obj, asyncio.AbstractEventLoop) and not obj.is_closed() and not obj.is_running():
-                        obj.close()
-                except Exception:
-                    pass
+            ventana.close()
+            app.processEvents()
 
 
 if __name__ == "__main__":
